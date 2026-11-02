@@ -59,3 +59,29 @@ make_esp_image () {
 clean_log () {
   sed -e 's/\x1b\[[0-9;?]*[A-Za-z]//g' -e 's/\r//g' "$1" | grep -vE '^\s*$'
 }
+
+# Add a Driver#### option for bt-kb-dxe.efi (first in DriverOrder) to an
+# OVMF variable store, so OVMF's boot manager loads the driver at every boot
+# before it connects the consoles, as on the real board. Boots the shell
+# once, without the Bluetooth controller. The PCI layout is the one of the
+# other QEMU runs (ESP on virtio-blk at 00:02.0, xHCI at 00:03.0), so the
+# option's device path, PciRoot(0x0)/Pci(0x2,0x0)/\bt-kb-dxe.efi, fits them.
+add_driver_option () {
+  local vars="$1" tmp ok=0
+  tmp="$(mktemp -d "$ROOT/qemu/.driver-option.XXXXXX")"
+  mkdir -p "$tmp/esp/EFI/BOOT"
+  cp "$SHELL_EFI" "$tmp/esp/EFI/BOOT/BOOTX64.EFI"
+  cp "$RUST_EFI_DIR/bt-kb-dxe.efi" "$tmp/esp/"
+  printf '%s\r\n' '@echo -off' 'fs0:' 'bcfg driver add 0 fs0:\bt-kb-dxe.efi "Bluetooth keyboard (bt-kb-dxe)"' \
+    'echo "=== driver options"' 'bcfg driver dump' 'reset -s' > "$tmp/esp/startup.nsh"
+  make_esp_image "$tmp/esp" "$tmp/esp.img"
+  timeout --foreground 60 "$QEMU" -machine q35,accel=kvm -cpu host -m 1G -nographic -no-reboot \
+    -drive if=pflash,format=raw,readonly=on,file="$OVMF_DIR/OVMF_CODE.4m.fd" \
+    -drive if=pflash,format=raw,file="$vars" \
+    -drive if=none,id=esp,format=raw,file="$tmp/esp.img" -device virtio-blk-pci,drive=esp \
+    -device qemu-xhci,id=xhci -net none -serial mon:stdio > "$tmp/serial.log" 2>&1 || true
+  clean_log "$tmp/serial.log" | sed -n '/=== driver options/,$p' | grep -E 'DevPath' | head -2
+  clean_log "$tmp/serial.log" | grep -q 'DevPath.*bt-kb-dxe.efi' && ok=1
+  rm -rf "$tmp"
+  [ "$ok" = 1 ]
+}
