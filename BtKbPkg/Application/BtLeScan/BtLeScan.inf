@@ -1,0 +1,33 @@
+## @file
+#  BtLeScan: LE scan through NimBLE on a MediaTek MT79xx controller (shell app).
+#
+#  SPDX-License-Identifier: BSD-2-Clause-Patent
+##
+
+[Defines]
+  INF_VERSION    = 0x00010017
+  BASE_NAME      = BtLeScan
+  FILE_GUID      = C09AE681-329A-4743-A1FC-4BE6EAFD88D3
+  MODULE_TYPE    = UEFI_APPLICATION
+  VERSION_STRING = 0.1
+  ENTRY_POINT    = ShellCEntryLib
+
+[Sources]
+  BtLeScan.c
+
+[Packages]
+  MdePkg/MdePkg.dec
+  ShellPkg/ShellPkg.dec
+  BtKbPkg/BtKbPkg.dec
+
+[LibraryClasses]
+  BaseLib
+  BaseMemoryLib
+  MemoryAllocationLib
+  MtkBtLib
+  NimbleHostLib
+  ShellCEntryLib
+  ShellLib
+  UefiBootServicesTableLib
+  UefiLib
+  UsbBtLib

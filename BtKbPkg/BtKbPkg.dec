@@ -17,5 +17,6 @@
   ##  @libraryclass  MediaTek MT79xx firmware parsing, WMT channel and upload.
   MtkBtLib|Include/Library/MtkBtLib.h
   ##  @libraryclass  Apache NimBLE host stack for single-threaded UEFI.
+  NimbleHostLib|Include/Library/NimbleHostLib.h
   ##  @libraryclass  HCI over USB helpers (discovery, MediaTek transport, HCI I/O).
   UsbBtLib|Include/Library/UsbBtLib.h

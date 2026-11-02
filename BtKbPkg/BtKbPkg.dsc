@@ -43,6 +43,7 @@
   ShellLib|ShellPkg/Library/UefiShellLib/UefiShellLib.inf
   ShellCEntryLib|ShellPkg/Library/UefiShellCEntryLib/UefiShellCEntryLib.inf
   MtkBtLib|BtKbPkg/Library/MtkBtLib/MtkBtLib.inf
+  NimbleHostLib|BtKbPkg/Library/NimbleLib/NimbleHostLib.inf
   UsbBtLib|BtKbPkg/Library/UsbBtLib/UsbBtLib.inf
 
 [PcdsFixedAtBuild]
@@ -51,5 +52,7 @@
 
 [Components]
   BtKbPkg/Library/MtkBtLib/MtkBtLib.inf
+  BtKbPkg/Library/NimbleLib/NimbleHostLib.inf
   BtKbPkg/Library/UsbBtLib/UsbBtLib.inf
   BtKbPkg/Application/BtHciProbe/BtHciProbe.inf
+  BtKbPkg/Application/BtLeScan/BtLeScan.inf

@@ -1,0 +1,92 @@
+## @file
+#  Apache NimBLE host (1.10.0) for single-threaded UEFI, behind NimbleHostLib.h.
+#
+#  NimBLE is built freestanding (-nostdinc) against the small C library in
+#  Port/libc, so no host headers leak into the firmware build.
+#
+#  NimBLE: Apache-2.0 (mynewt-nimble/LICENSE, NOTICE). Port and glue:
+#  SPDX-License-Identifier: BSD-2-Clause-Patent
+##
+
+[Defines]
+  INF_VERSION    = 0x00010017
+  BASE_NAME      = NimbleHostLib
+  FILE_GUID      = 89F9E81A-17E8-4753-A16A-0CAAD61915C0
+  MODULE_TYPE    = BASE
+  VERSION_STRING = 0.1
+  LIBRARY_CLASS  = NimbleHostLib
+  DEFINE NIMBLE  = mynewt-nimble
+
+[Sources]
+  NimbleHost.c
+  Port/libc_uefi.c
+  Port/npl_os_uefi.c
+  Port/transport_uefi.c
+  Port/nimble_uefi_port.h
+  $(NIMBLE)/nimble/transport/src/transport.c
+  $(NIMBLE)/porting/nimble/src/endian.c
+  $(NIMBLE)/porting/nimble/src/mem.c
+  $(NIMBLE)/porting/nimble/src/nimble_port.c
+  $(NIMBLE)/porting/nimble/src/os_mbuf.c
+  $(NIMBLE)/porting/nimble/src/os_mempool.c
+  $(NIMBLE)/porting/nimble/src/os_msys.c
+  $(NIMBLE)/nimble/host/src/ble_att.c
+  $(NIMBLE)/nimble/host/src/ble_att_clt.c
+  $(NIMBLE)/nimble/host/src/ble_att_cmd.c
+  $(NIMBLE)/nimble/host/src/ble_att_svr.c
+  $(NIMBLE)/nimble/host/src/ble_cs.c
+  $(NIMBLE)/nimble/host/src/ble_dtm.c
+  $(NIMBLE)/nimble/host/src/ble_eatt.c
+  $(NIMBLE)/nimble/host/src/ble_eddystone.c
+  $(NIMBLE)/nimble/host/src/ble_gap.c
+  $(NIMBLE)/nimble/host/src/ble_gattc.c
+  $(NIMBLE)/nimble/host/src/ble_gatts.c
+  $(NIMBLE)/nimble/host/src/ble_hs_adv.c
+  $(NIMBLE)/nimble/host/src/ble_hs_atomic.c
+  $(NIMBLE)/nimble/host/src/ble_hs.c
+  $(NIMBLE)/nimble/host/src/ble_hs_cfg.c
+  $(NIMBLE)/nimble/host/src/ble_hs_conn.c
+  $(NIMBLE)/nimble/host/src/ble_hs_flow.c
+  $(NIMBLE)/nimble/host/src/ble_hs_hci.c
+  $(NIMBLE)/nimble/host/src/ble_hs_hci_cmd.c
+  $(NIMBLE)/nimble/host/src/ble_hs_hci_evt.c
+  $(NIMBLE)/nimble/host/src/ble_hs_hci_util.c
+  $(NIMBLE)/nimble/host/src/ble_hs_id.c
+  $(NIMBLE)/nimble/host/src/ble_hs_log.c
+  $(NIMBLE)/nimble/host/src/ble_hs_mbuf.c
+  $(NIMBLE)/nimble/host/src/ble_hs_misc.c
+  $(NIMBLE)/nimble/host/src/ble_hs_mqueue.c
+  $(NIMBLE)/nimble/host/src/ble_hs_periodic_sync.c
+  $(NIMBLE)/nimble/host/src/ble_hs_pvcy.c
+  $(NIMBLE)/nimble/host/src/ble_hs_shutdown.c
+  $(NIMBLE)/nimble/host/src/ble_hs_startup.c
+  $(NIMBLE)/nimble/host/src/ble_hs_stop.c
+  $(NIMBLE)/nimble/host/src/ble_ibeacon.c
+  $(NIMBLE)/nimble/host/src/ble_iso.c
+  $(NIMBLE)/nimble/host/src/ble_l2cap.c
+  $(NIMBLE)/nimble/host/src/ble_l2cap_coc.c
+  $(NIMBLE)/nimble/host/src/ble_l2cap_sig.c
+  $(NIMBLE)/nimble/host/src/ble_l2cap_sig_cmd.c
+  $(NIMBLE)/nimble/host/src/ble_sm_alg.c
+  $(NIMBLE)/nimble/host/src/ble_sm.c
+  $(NIMBLE)/nimble/host/src/ble_sm_cmd.c
+  $(NIMBLE)/nimble/host/src/ble_sm_lgcy.c
+  $(NIMBLE)/nimble/host/src/ble_sm_sc.c
+  $(NIMBLE)/nimble/host/src/ble_store.c
+  $(NIMBLE)/nimble/host/src/ble_store_util.c
+  $(NIMBLE)/nimble/host/src/ble_uuid.c
+
+[Packages]
+  MdePkg/MdePkg.dec
+  BtKbPkg/BtKbPkg.dec
+
+[LibraryClasses]
+  BaseLib
+  BaseMemoryLib
+  DebugLib
+  MemoryAllocationLib
+  UefiBootServicesTableLib
+  UefiLib
+
+[BuildOptions]
+  GCC:*_*_X64_CC_FLAGS = -nostdinc -std=gnu11 -fno-tree-loop-distribute-patterns -Wno-error -I$(MODULE_DIR)/Port/include -I$(MODULE_DIR)/Port/libc -I$(MODULE_DIR)/$(NIMBLE)/nimble/include -I$(MODULE_DIR)/$(NIMBLE)/nimble/host/include -I$(MODULE_DIR)/$(NIMBLE)/nimble/transport/include -I$(MODULE_DIR)/$(NIMBLE)/porting/nimble/include

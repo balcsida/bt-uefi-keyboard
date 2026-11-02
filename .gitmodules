@@ -1,3 +1,6 @@
 [submodule "edk2"]
 	path = edk2
 	url = https://github.com/tianocore/edk2.git
+[submodule "BtKbPkg/Library/NimbleLib/mynewt-nimble"]
+	path = BtKbPkg/Library/NimbleLib/mynewt-nimble
+	url = https://github.com/apache/mynewt-nimble.git
