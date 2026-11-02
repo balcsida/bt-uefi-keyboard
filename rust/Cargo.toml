@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["mtk-bt"]
+# Plain `cargo test` runs the host-testable crates only; UEFI crates are built
+# with `--target x86_64-unknown-uefi` (see scripts/build-rust.sh).
+default-members = ["mtk-bt"]
+
+[workspace.package]
+edition = "2024"
+license = "BSD-2-Clause-Patent"
+authors = ["Dávid Balatoni <balcsida@gmail.com>"]
+version = "0.1.0"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
