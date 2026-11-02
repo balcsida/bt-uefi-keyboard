@@ -1,0 +1,34 @@
+## @file
+#  BtHciProbe: MediaTek MT79xx Bluetooth bring-up probe (UEFI shell app).
+#
+#  SPDX-License-Identifier: BSD-2-Clause-Patent
+##
+
+[Defines]
+  INF_VERSION    = 0x00010017
+  BASE_NAME      = BtHciProbe
+  FILE_GUID      = FA5A170D-DF1F-4E47-A764-3DAA80502657
+  MODULE_TYPE    = UEFI_APPLICATION
+  VERSION_STRING = 0.1
+  ENTRY_POINT    = ShellCEntryLib
+
+[Sources]
+  BtHciProbe.c
+
+[Packages]
+  MdePkg/MdePkg.dec
+  ShellPkg/ShellPkg.dec
+  BtKbPkg/BtKbPkg.dec
+
+[LibraryClasses]
+  BaseLib
+  BaseMemoryLib
+  DebugLib
+  DevicePathLib
+  MemoryAllocationLib
+  MtkBtLib
+  ShellCEntryLib
+  ShellLib
+  UefiBootServicesTableLib
+  UefiLib
+  UsbBtLib

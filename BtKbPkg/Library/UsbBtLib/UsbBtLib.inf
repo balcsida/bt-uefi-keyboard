@@ -1,0 +1,31 @@
+## @file
+#  HCI over USB helpers: interface discovery, MediaTek transport, HCI I/O.
+#
+#  SPDX-License-Identifier: BSD-2-Clause-Patent
+##
+
+[Defines]
+  INF_VERSION    = 0x00010017
+  BASE_NAME      = UsbBtLib
+  FILE_GUID      = 1524AE50-486A-49FE-B8EF-E3EDED41785F
+  MODULE_TYPE    = UEFI_DRIVER
+  VERSION_STRING = 0.1
+  LIBRARY_CLASS  = UsbBtLib|UEFI_APPLICATION UEFI_DRIVER DXE_DRIVER
+
+[Sources]
+  UsbBtLib.c
+
+[Packages]
+  MdePkg/MdePkg.dec
+  BtKbPkg/BtKbPkg.dec
+
+[LibraryClasses]
+  BaseLib
+  BaseMemoryLib
+  MemoryAllocationLib
+  MtkBtLib
+  UefiBootServicesTableLib
+  UefiLib
+
+[Protocols]
+  gEfiUsbIoProtocolGuid    ## CONSUMES
