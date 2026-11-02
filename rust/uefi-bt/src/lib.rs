@@ -219,6 +219,23 @@ pub struct DrainReport {
     pub events: u32,
     pub acl: u32,
     pub ms: u64,
+    /// Connection handle of the last data packet: a link the controller
+    /// kept from before (it keeps links across host resets).
+    pub acl_handle: Option<u16>,
+}
+
+/// How an HCI_Disconnect sent by [`UsbHci::disconnect`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisconnectOutcome {
+    /// There was no such connection.
+    NoConnection,
+    /// The link was there and is closed now.
+    Closed { reason: u8 },
+    /// Accepted, but no Disconnection Complete in time (the peer may be
+    /// out of range); a reset clears the link anyway.
+    NoCompletion,
+    /// Refused, or completed with an error status.
+    Failed(u8),
 }
 
 impl DrainReport {
@@ -505,8 +522,11 @@ impl UsbHci {
                 Err(HciError::Usb(e)) if e.status == Status::TIMEOUT => {}
                 Err(e) => return Err(e),
             }
-            if self.read_acl(&mut buf, 1)?.is_some() {
+            if let Some(acl) = self.read_acl(&mut buf, 1)? {
                 report.acl += 1;
+                if let AclKind::Data { handle } = acl.kind {
+                    report.acl_handle = Some(handle);
+                }
                 self.stats.acl_discarded += 1;
                 last = clock::now_ms();
             }
@@ -632,6 +652,38 @@ impl UsbHci {
             }
         }
         Err(HciError::Timeout)
+    }
+
+    /// HCI_Disconnect for `handle` with `reason`, waiting up to
+    /// `timeout_ms` for the outcome. ACL data keeps being read meanwhile.
+    pub fn disconnect(&mut self, handle: u16, reason: u8, timeout_ms: u32) -> Result<DisconnectOutcome, HciError> {
+        use crate::link::{disconnect_step, DisconnectStep};
+        let [lo, hi] = handle.to_le_bytes();
+        self.send_command(&[0x06, 0x04, 0x03, lo, hi, reason])?;
+        let mut accepted = false;
+        let mut buf = [0u8; ACL_BUF];
+        let start = clock::now_ms();
+        while clock::now_ms() - start < u64::from(timeout_ms) {
+            match self.read_event(&mut buf, 10) {
+                Ok(len) => match disconnect_step(&buf[..len], handle) {
+                    Some(DisconnectStep::Accepted) => accepted = true,
+                    Some(DisconnectStep::NoConnection) => return Ok(DisconnectOutcome::NoConnection),
+                    Some(DisconnectStep::Refused(status)) => return Ok(DisconnectOutcome::Failed(status)),
+                    Some(DisconnectStep::Complete { status: 0, reason }) => return Ok(DisconnectOutcome::Closed { reason }),
+                    Some(DisconnectStep::Complete { status, .. }) => return Ok(DisconnectOutcome::Failed(status)),
+                    None => {}
+                },
+                Err(HciError::Usb(e)) if e.status == Status::TIMEOUT => {}
+                Err(e) => return Err(e),
+            }
+            if self.read_acl(&mut buf, 1)?.is_some() {
+                self.stats.acl_discarded += 1;
+            }
+            if self.firmware_crashed() {
+                return Err(HciError::FirmwareCrashed);
+            }
+        }
+        if accepted { Ok(DisconnectOutcome::NoCompletion) } else { Err(HciError::Timeout) }
     }
 }
 
