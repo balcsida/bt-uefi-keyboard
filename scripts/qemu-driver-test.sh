@@ -13,6 +13,11 @@
 #   6. loaded at boot, no controller: the driver watches USB, the boot goes
 #      on to the shell, the OS hand-off runs and ends the boot record
 #      (BtKbLastBoot); a second boot logs that record as the previous boot.
+#   7. the board's diagnostics boot (scripts/board-diag.sh) on a GPT disk,
+#      with a short-form Driver#### entry as efibootmgr writes it: the shell
+#      in \EFI\btkb replaces it with a full device path, loads the driver;
+#      `btlog` and `linux` are typed over QMP, the log is saved, and the
+#      system's Limine chainloads ebs-test.efi in place of Linux.
 # The driver's log (QEMU debug console, port 0x402) is shown after each run.
 # ONLY="1 3" runs just those cases.
 set -euo pipefail
@@ -156,4 +161,60 @@ if grep -q 'previous boot: loaded .* OS started' "$work/boot/driver.log"; then
 else
   echo "boot record: NOT FOUND in the second boot's log"
 fi
+fi
+
+if want 7; then
+echo
+echo "##### 7. board diagnostics boot: shell in \\EFI\\btkb, driver loaded, linux typed, Limine starts the OS"
+d="$work/diag"
+rm -rf "$d"
+mkdir -p "$d/esp/EFI/BOOT" "$d/esp/EFI/btkb/diag" "$d/esp/EFI/limine"
+# OVMF boots an outer shell that starts the one in \EFI\btkb (on the board,
+# BootNext does that). First it adds a short-form driver entry, as
+# efibootmgr wrote on the board; added after the firmware's driver pass, it
+# isn't loaded in this boot, as on the board.
+cp "$SHELL_EFI" "$d/esp/EFI/BOOT/BOOTX64.EFI"
+printf '%s\r\n' '@echo -off' \
+  'bcfg driver addp 0 fs0:\EFI\btkb\bt-kb-dxe.efi "Bluetooth keyboard (bt-kb-dxe)"' \
+  'fs0:\EFI\btkb\Shell.efi' > "$d/esp/startup.nsh"
+cp "$SHELL_EFI" "$d/esp/EFI/btkb/Shell.efi"
+cp "$DRIVER" "$FW_BIN" "$RUST_EFI_DIR/ebs-test.efi" "$d/esp/EFI/btkb/"
+cp "$RUST_EFI_DIR/bt-kb-log.efi" "$d/esp/EFI/btkb/btlog.efi"
+fake_bond "$d/esp/EFI/btkb"
+write_diag_scripts "$d/esp/EFI/btkb" '\EFI\limine\limine_x64.efi'
+# The system's Limine; its one entry chainloads ebs-test.efi in place of Linux.
+cp /usr/share/limine/BOOTX64.EFI "$d/esp/EFI/limine/limine_x64.efi"
+printf 'timeout: 1\n\n/ebs-test (stands in for Linux)\n    protocol: efi\n    path: boot():/EFI/btkb/ebs-test.efi\n' \
+  > "$d/esp/EFI/limine/limine.conf"
+make_gpt_esp_image "$d/esp" "$d/disk.img"
+cp "$OVMF_DIR/OVMF_VARS.4m.fd" "$d/OVMF_VARS.4m.fd"
+: > "$d/driver.log"
+: > "$d/serial.log"
+timeout 150 "$QEMU" -machine q35,accel=kvm -cpu host -m 1G -no-reboot \
+  -drive if=pflash,format=raw,readonly=on,file="$OVMF_DIR/OVMF_CODE.4m.fd" \
+  -drive if=pflash,format=raw,file="$d/OVMF_VARS.4m.fd" \
+  -drive if=none,id=disk,format=raw,file="$d/disk.img" -device virtio-blk-pci,drive=disk \
+  -device qemu-xhci,id=xhci \
+  -chardev file,id=dbg,path="$d/driver.log" -device isa-debugcon,iobase=0x402,chardev=dbg \
+  -display none -serial file:"$d/serial.log" -monitor none \
+  -qmp unix:"$d/qmp.sock",server=on,wait=off -net none > "$d/qemu.out" 2>&1 &
+qemu_pid=$!
+python3 -I "$ROOT/scripts/qmp-type.py" "$d/qmp.sock" "$d/serial.log" 'board-diag.sh --collect' 'btlog\n' 100 || true
+python3 -I "$ROOT/scripts/qmp-type.py" "$d/qmp.sock" "$d/serial.log" 'Keyboard layout remembered' 'linux\n' 60 || true
+wait "$qemu_pid" || echo "(QEMU exit status $?)"
+clean_log "$d/serial.log" | sed -n '/=== bt-kb-dxe diagnostics/,$p' | head -30
+img="$d/disk.img@@1048576"
+echo "--- diag files on the ESP:"
+mdir -i "$img" -b ::/EFI/btkb/diag 2>/dev/null | sed 's|^::/EFI/btkb/diag/|  |'
+show () { mtype -i "$img" "::/EFI/btkb/diag/$1" 2>/dev/null | tr -d '\r'; }
+echo "--- load.txt: $(show load.txt | grep -v '^\s*$' | head -2)"
+echo "--- driver loaded after the shell's load: $(show drivers-after.txt | grep -c 'Bluetooth LE keyboard')"
+echo "--- our variables after load: $(show vars-after.txt | grep -oE 'BtKb[A-Za-z]+' | sort -u | tr '\n' ' ')"
+echo "--- driver entry before: $(show bcfg-driver-before.txt | grep -m1 'DevPath' | sed 's/^[[:space:]]*//')"
+echo "--- driver entry after:  $(show bcfg-driver-after.txt | grep -m1 'DevPath' | sed 's/^[[:space:]]*//')"
+echo "--- driver entries after: $(show bcfg-driver-after.txt | grep -c '^Option')"
+echo "--- started from Driver#### before the shell's load: $(show drivers-before.txt | grep -c 'Bluetooth LE keyboard')"
+echo "--- btlog.txt: $(show btlog.txt | grep -c 'bt-kb-dxe 0.1.0 starting') start line(s), $(show btlog.txt | grep -c 'Boot-loop counter') counter line(s)"
+echo "--- driver log"
+cat "$d/driver.log"
 fi
