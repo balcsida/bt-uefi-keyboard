@@ -10,10 +10,12 @@ extern crate alloc;
 pub mod output;
 pub mod app;
 pub mod att;
+pub mod bond;
 pub mod clock;
 #[cfg(feature = "embassy")]
 pub mod embassy;
 pub mod emergency;
+pub mod hid;
 pub mod pipe;
 pub mod trace;
 
