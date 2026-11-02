@@ -1,0 +1,8 @@
+/Build/
+/Conf/
+/tools/
+/qemu/
+*.efi
+*.bin
+/rust/target/
+/board/
