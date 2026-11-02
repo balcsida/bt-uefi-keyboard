@@ -10,6 +10,7 @@ extern crate alloc;
 pub mod output;
 pub mod app;
 pub mod att;
+pub mod bootrec;
 pub mod bond;
 pub mod clock;
 #[cfg(feature = "embassy")]
