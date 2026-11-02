@@ -1,0 +1,16 @@
+[package]
+name = "bt-le-scan"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+version.workspace = true
+
+[dependencies]
+mtk-bt = { path = "../mtk-bt" }
+uefi-bt = { path = "../uefi-bt", features = ["embassy", "panic-handler"] }
+uefi = { version = "0.41", features = ["alloc", "global_allocator", "logger"] }
+trouble-host = { version = "0.8", default-features = false, features = ["central", "scan", "default-packet-pool", "log"] }
+bt-hci = { version = "0.10", default-features = false }
+embassy-futures = "0.1"
+embassy-time = "0.5"
+log = "0.4"
