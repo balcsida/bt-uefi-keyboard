@@ -11,6 +11,8 @@ pub mod output;
 pub mod app;
 pub mod att;
 pub mod clock;
+#[cfg(feature = "embassy")]
+pub mod embassy;
 pub mod emergency;
 pub mod pipe;
 pub mod trace;
