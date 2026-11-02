@@ -54,6 +54,18 @@ if have BtKbLog; then
   echo
 else
   echo "No BtKbLog: the driver didn't run during this boot, or couldn't write its log."
+  init_us="$(loader_us LoaderTimeInitUSec || true)"
+  if [ -n "$init_us" ]; then
+    echo "The firmware started the boot loader $(awk -v us="$init_us" 'BEGIN { printf "%.2f", us / 1e6 }') s after the CPU reset."
+  fi
+  # AMI's Fast Boot module keeps its state in this vendor GUID. A fast boot
+  # boots the stored option directly and skips Driver#### (Nov 2: 10.7 s to
+  # the boot loader and no driver, against 14.3-15.1 s in full boots).
+  if [ -f "$EFIVARS/FastBootOption-b540a530-6978-4da7-91cb-7207d764d262" ]; then
+    echo "If the driver is installed, the likely cause is AMI's Fast Boot: a fast boot skips driver"
+    echo "entries (and the setup key). Full boots on Nov 2 reached the boot loader after 14.3-15.1 s,"
+    echo "the fast one after about 10.7 s. The setting is in firmware setup, Boot page (Fast Boot)."
+  fi
 fi
 # The driver's one-line records (BtKbLastBoot, non-volatile): this boot's
 # as last written, and the previous boot's as this boot found it.
