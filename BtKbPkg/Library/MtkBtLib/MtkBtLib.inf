@@ -1,0 +1,26 @@
+## @file
+#  MediaTek MT79xx Bluetooth bring-up: firmware parsing, WMT channel, upload.
+#
+#  SPDX-License-Identifier: BSD-2-Clause-Patent
+##
+
+[Defines]
+  INF_VERSION    = 0x00010017
+  BASE_NAME      = MtkBtLib
+  FILE_GUID      = 86577CBD-2F26-4C63-96A7-2E5A093A65D4
+  MODULE_TYPE    = BASE
+  VERSION_STRING = 0.1
+  LIBRARY_CLASS  = MtkBtLib
+
+[Sources]
+  MtkBtFirmware.c
+  MtkBtWmt.c
+
+[Packages]
+  MdePkg/MdePkg.dec
+  BtKbPkg/BtKbPkg.dec
+
+[LibraryClasses]
+  BaseLib
+  BaseMemoryLib
+  DebugLib

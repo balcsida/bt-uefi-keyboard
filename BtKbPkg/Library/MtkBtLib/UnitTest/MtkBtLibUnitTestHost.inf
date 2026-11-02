@@ -1,0 +1,31 @@
+## @file
+#  Host-based unit tests for MtkBtLib against a simulated MT7922.
+#
+#  SPDX-License-Identifier: BSD-2-Clause-Patent
+##
+
+[Defines]
+  INF_VERSION    = 0x00010017
+  BASE_NAME      = MtkBtLibUnitTestHost
+  FILE_GUID      = 391696AA-DC94-4E38-A0C2-7FA2A054BC2D
+  MODULE_TYPE    = HOST_APPLICATION
+  VERSION_STRING = 0.1
+
+[Sources]
+  MtkBtLibUnitTest.c
+  MtkBtSim.c
+  MtkBtSim.h
+
+[Packages]
+  MdePkg/MdePkg.dec
+  UnitTestFrameworkPkg/UnitTestFrameworkPkg.dec
+  BtKbPkg/BtKbPkg.dec
+
+[LibraryClasses]
+  BaseLib
+  BaseMemoryLib
+  DebugLib
+  MemoryAllocationLib
+  MtkBtLib
+  PrintLib
+  UnitTestLib

@@ -1,0 +1,20 @@
+## @file
+#  Bluetooth keyboard support for UEFI firmware setup.
+#
+#  SPDX-License-Identifier: BSD-2-Clause-Patent
+##
+
+[Defines]
+  DEC_SPECIFICATION = 0x00010017
+  PACKAGE_NAME      = BtKbPkg
+  PACKAGE_GUID      = 07815EE5-C353-400C-A663-D1AA93FA9F10
+  PACKAGE_VERSION   = 0.1
+
+[Includes]
+  Include
+
+[LibraryClasses]
+  ##  @libraryclass  MediaTek MT79xx firmware parsing, WMT channel and upload.
+  MtkBtLib|Include/Library/MtkBtLib.h
+  ##  @libraryclass  Apache NimBLE host stack for single-threaded UEFI.
+  ##  @libraryclass  HCI over USB helpers (discovery, MediaTek transport, HCI I/O).
