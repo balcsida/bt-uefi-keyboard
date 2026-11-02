@@ -1,0 +1,12 @@
+[package]
+name = "ebs-test"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+version.workspace = true
+
+[dependencies]
+# The project's panic handler, as in the other apps: uefi's own clashes with
+# it when everything is built together.
+uefi-bt = { path = "../uefi-bt", features = ["panic-handler"] }
+uefi = { version = "0.41", features = ["alloc", "global_allocator"] }
