@@ -16,6 +16,7 @@ pub mod clock;
 pub mod embassy;
 pub mod emergency;
 pub mod hid;
+pub mod keymap;
 pub mod pipe;
 pub mod trace;
 
