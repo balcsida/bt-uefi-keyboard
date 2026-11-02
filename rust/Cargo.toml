@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["mtk-bt", "uefi-bt"]
+members = ["mtk-bt", "uefi-bt", "bt-hci-probe"]
 # Plain `cargo test` runs the host-testable crates only; UEFI crates are built
 # with `--target x86_64-unknown-uefi` (see scripts/build-rust.sh).
 default-members = ["mtk-bt"]

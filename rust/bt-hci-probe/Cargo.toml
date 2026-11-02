@@ -1,0 +1,11 @@
+[package]
+name = "bt-hci-probe"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+version.workspace = true
+
+[dependencies]
+mtk-bt = { path = "../mtk-bt" }
+uefi-bt = { path = "../uefi-bt", features = ["panic-handler"] }
+uefi = { version = "0.41", features = ["alloc", "global_allocator", "logger"] }
