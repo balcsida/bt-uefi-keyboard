@@ -19,6 +19,7 @@ pub mod emergency;
 pub mod hid;
 pub mod keymap;
 pub mod link;
+pub mod logbuf;
 pub mod pipe;
 pub mod trace;
 
