@@ -1,0 +1,25 @@
+[package]
+name = "uefi-bt"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+version.workspace = true
+
+[features]
+# Panic handler that hands the controller back and exits to the shell,
+# instead of uefi-rs's, which shuts the machine down. Apps enable this and
+# drop uefi's "panic_handler" feature.
+panic-handler = []
+# Async runtime glue for TrouBLE: time driver, critical section, bt-hci transport.
+embassy = ["dep:bt-hci", "dep:bt-hci-transport", "dep:embassy-time-driver", "dep:embassy-futures", "dep:critical-section", "dep:embedded-io"]
+
+[dependencies]
+mtk-bt = { path = "../mtk-bt" }
+uefi = { version = "0.41", features = ["alloc"] }
+uefi-raw = "0.17"
+bt-hci = { version = "0.10", default-features = false, optional = true }
+bt-hci-transport = { version = "0.1", optional = true }
+embassy-time-driver = { version = "0.2", optional = true }
+embassy-futures = { version = "0.1", optional = true }
+critical-section = { version = "1", optional = true }
+embedded-io = { version = "0.7", optional = true }
