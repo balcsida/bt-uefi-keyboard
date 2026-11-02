@@ -1,0 +1,24 @@
+[package]
+name = "bt-kb-probe"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+version.workspace = true
+
+[dependencies]
+mtk-bt = { path = "../mtk-bt" }
+uefi-bt = { path = "../uefi-bt", features = ["embassy", "panic-handler"] }
+uefi = { version = "0.41", features = ["alloc", "global_allocator", "logger"] }
+# TrouBLE's defaults are a 1-slot notification queue and 16 packet buffers:
+# bursts of key reports lost notifications (stuck keys) and typing during
+# connection setup ran the pool out (Nov 1). Sized up here.
+trouble-host = { version = "0.8", default-features = false, features = [
+    "central", "scan", "gatt", "security", "legacy-pairing", "log",
+    "default-packet-pool", "default-packet-pool-size-64",
+    "gatt-client-notification-queue-size-32", "gatt-client-notification-max-subscribers-4",
+    "l2cap-rx-queue-size-32", "connection-event-queue-size-8",
+] }
+bt-hci = { version = "0.10", default-features = false }
+embassy-futures = "0.1"
+embassy-time = "0.5"
+log = "0.4"
