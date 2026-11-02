@@ -85,3 +85,78 @@ add_driver_option () {
   rm -rf "$tmp"
   [ "$ok" = 1 ]
 }
+
+# The UEFI shell scripts for a diagnostics boot on the board, written into
+# a directory that becomes \EFI\btkb\ on the ESP (CRLF line endings):
+#   startup.nsh  run by the shell by itself: firmware information into
+#                diag\ (did the firmware start bt-kb-dxe from Driver####?),
+#                the driver entry replaced by one with the firmware's own
+#                full device path, bt-kb-dxe.efi loaded, more information;
+#   linux.nsh    typed as `linux` at the end: the driver's log saved
+#                (btlog.efi), then Limine started.
+# $2: Limine's path on the ESP, e.g. '\EFI\limine\limine_x64.efi'.
+DIAG_GUID=5223227b-ac96-454e-9bca-f15199748a3c
+write_diag_scripts () {
+  local dir="$1" limine="$2"
+  printf '%s\r\n' \
+    '@echo -off' \
+    '# bt-kb-dxe diagnostics on the board (scripts/board-diag.sh).' \
+    '%homefilesystem%' \
+    'cd \EFI\btkb' \
+    'echo "=== bt-kb-dxe diagnostics: saving firmware information to \EFI\btkb\diag\"' \
+    'ver >a diag\ver.txt' \
+    'bcfg driver dump -v >a diag\bcfg-driver-before.txt' \
+    'drivers >a diag\drivers-before.txt' \
+    "dmpstore -guid $DIAG_GUID >a diag\\vars-before.txt" \
+    'btlog >a diag\btlog-before.txt' \
+    'echo "=== driver entry: replaced by one with the firmware'"'"'s own full device path"' \
+    'bcfg driver rm 0 >a diag\bcfg-rm.txt' \
+    'bcfg driver add 0 bt-kb-dxe.efi "Bluetooth keyboard (bt-kb-dxe)" >a diag\bcfg-add.txt' \
+    'bcfg driver dump -v >a diag\bcfg-driver-after.txt' \
+    'type diag\bcfg-driver-after.txt' \
+    'echo "=== load bt-kb-dxe.efi"' \
+    'load bt-kb-dxe.efi >a diag\load.txt' \
+    'type diag\load.txt' \
+    'echo ">>> Press a key on the Bluetooth keyboard now."' \
+    'devices >a diag\devices.txt' \
+    'dh -v -p USBIO >a diag\usbio.txt' \
+    'map >a diag\map.txt' \
+    'drivers >a diag\drivers-after.txt' \
+    "dmpstore -guid $DIAG_GUID >a diag\\vars-after.txt" \
+    'echo " "' \
+    'echo "Type with the Bluetooth keyboard, e.g.  echo hello"' \
+    'echo "Type  btlog  to see the driver'"'"'s log: when the keyboard connected, and how."' \
+    'echo "When done, type  linux  to start Linux. It saves the log first: please"' \
+    'echo "don'"'"'t reset from here, that loses it. In Linux:  sudo scripts/board-diag.sh --collect"' \
+    'echo "No typing from the Bluetooth keyboard? Type linux on a wired USB keyboard, or leave"' \
+    'echo "the Bluetooth keyboard alone for 2 minutes, then press the reset button."' \
+    > "$dir/startup.nsh"
+  printf '%s\r\n' \
+    '@echo -off' \
+    '# Typed at the end of the diagnostics (scripts/board-diag.sh).' \
+    '%homefilesystem%' \
+    'cd \EFI\btkb' \
+    'echo "=== saving the driver'"'"'s log to \EFI\btkb\diag\btlog.txt"' \
+    'btlog >a diag\btlog.txt' \
+    "dmpstore -guid $DIAG_GUID >a diag\\vars-end.txt" \
+    'echo "=== starting Limine"' \
+    "%homefilesystem%$limine" \
+    'echo "Limine returned. Type linux to try again."' \
+    > "$dir/linux.nsh"
+}
+
+# A GPT disk image with one EFI system partition holding a directory's
+# contents (attached as virtio-blk), so device paths end in HD(1,GPT,...)
+# as on the board. The partition starts at 1 MiB.
+make_gpt_esp_image () {
+  local dir="$1" img="$2" part="$2.part"
+  rm -f "$img" "$part"
+  truncate -s 66M "$img"
+  printf 'label: gpt\nstart=2048, size=131072, type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B, name="EFI system partition"\n' \
+    | sfdisk -q "$img"
+  truncate -s 64M "$part"
+  mformat -i "$part" -F -v ESP ::
+  mcopy -i "$part" -s -Q "$dir"/* ::/
+  dd if="$part" of="$img" bs=1M seek=1 conv=notrunc status=none
+  rm -f "$part"
+}
