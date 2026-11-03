@@ -136,19 +136,29 @@ async fn keep_connected(
     }
 }
 
-/// How the session learned that the link is encrypted.
+/// How the session learned that the link is encrypted with the bonded key.
+/// Always from the driver's tap; the host stack may or may not agree.
 enum Encryption {
-    /// From the host stack (its Encrypted or PairingComplete event, or its
-    /// security level).
+    /// The tap saw it, and the host stack registered it too.
     Host,
-    /// Only from the controller's report (the driver's tap).
+    /// Only the tap saw it: the host stack didn't register it.
     ControllerOnly,
 }
 
-/// Wait until the link is encrypted. Connection parameter requests are
-/// kept in `params` and answered by the caller afterwards: answering means
-/// waiting on HCI commands and an L2CAP reply, and nothing may hold up this
-/// loop meanwhile.
+/// Wait until the link is encrypted with the bonded key. Connection
+/// parameter requests are kept in `params` and answered by the caller
+/// afterwards: answering means waiting on HCI commands and an L2CAP reply,
+/// and nothing may hold up this loop meanwhile.
+///
+/// Only the driver's tap decides: the controller reported this connection
+/// encrypted, after LE Enable Encryption with the bonded key
+/// (`uefi_bt::tap`). The host stack's word alone doesn't count, as TrouBLE
+/// 0.8 reports a resumed bond the way it reports a fresh pairing: its
+/// central pairing machine waits for the bonded encryption, ends in Success
+/// and sends PairingComplete with the stored bond (then Encrypted). A fresh
+/// pairing can't get past the tap: its SMP packets are dropped, and LE
+/// Enable Encryption with a new key is refused. If the host stack reports
+/// an encryption the tap doesn't confirm, the session ends.
 async fn wait_encrypted(
     stack: &'static Stack<'static, Ctrl, Pool>,
     conn: &Connection<'static, Pool>,
@@ -157,19 +167,33 @@ async fn wait_encrypted(
 ) -> Result<Encryption, String> {
     let handle = conn.handle().raw();
     let mut reported_at: Option<Instant> = None;
+    let mut host_at: Option<Instant> = None;
     loop {
-        if conn.security_level().is_ok_and(|level| level != SecurityLevel::NoEncryption) {
-            return Ok(Encryption::Host);
+        if host_at.is_none() && conn.security_level().is_ok_and(|level| level != SecurityLevel::NoEncryption) {
+            host_at = Some(Instant::now());
         }
-        if shared.encrypted.get() == Some(handle) {
-            let at = *reported_at.get_or_insert_with(Instant::now);
-            if at.elapsed() >= HOST_ENCRYPTION_GRACE {
-                return Ok(Encryption::ControllerOnly);
+        let tap = shared.encrypted.get() == Some(handle);
+        match (host_at, tap) {
+            (Some(_), true) => return Ok(Encryption::Host),
+            (Some(at), false) if at.elapsed() >= HOST_ENCRYPTION_GRACE => {
+                return Err(String::from(
+                    "the host stack reports an encryption the driver didn't see with the bonded key",
+                ));
             }
+            (None, true) => {
+                let at = *reported_at.get_or_insert_with(Instant::now);
+                if at.elapsed() >= HOST_ENCRYPTION_GRACE {
+                    return Ok(Encryption::ControllerOnly);
+                }
+            }
+            _ => {}
         }
         match select(conn.next(), Timer::after(Duration::from_millis(20))).await {
             Either::First(event) => match event {
-                ConnectionEvent::Encrypted { .. } | ConnectionEvent::PairingComplete { .. } => return Ok(Encryption::Host),
+                // A resumed bond, as TrouBLE reports it; the tap decides.
+                ConnectionEvent::Encrypted { .. } | ConnectionEvent::PairingComplete { .. } => {
+                    host_at.get_or_insert_with(Instant::now);
+                }
                 ConnectionEvent::PairingFailed(e) => return Err(alloc::format!("encryption failed: {e:?}")),
                 ConnectionEvent::BondLost => return Err(String::from("the keyboard rejected the stored key")),
                 ConnectionEvent::Disconnected { reason } => return Err(alloc::format!("disconnected: {reason:?}")),

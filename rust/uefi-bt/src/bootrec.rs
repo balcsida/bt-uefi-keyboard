@@ -38,6 +38,10 @@ pub struct BootRecord {
     pub disconnects: u32,
     pub last_disconnect_reason: Option<u8>,
     pub key_reports: u32,
+    /// Key reports that arrived before the link was encrypted (dropped).
+    pub pre_encryption_dropped: u32,
+    /// Pairing (SMP) packets dropped, both directions.
+    pub smp_dropped: u32,
     /// Hotkey-like keys delivered (F-keys, Esc, Delete), with counts.
     pub hotkeys: Vec<(&'static str, u32)>,
     pub healthy_ms: Option<u64>,
@@ -102,6 +106,12 @@ impl BootRecord {
                 None => {}
             }
             let _ = write!(s, "; {} key reports", self.key_reports);
+            if self.pre_encryption_dropped > 0 {
+                let _ = write!(s, " ({} from before encryption dropped)", self.pre_encryption_dropped);
+            }
+        }
+        if self.smp_dropped > 0 {
+            let _ = write!(s, "; {} pairing packets dropped", self.smp_dropped);
         }
         if self.disconnects > 0 {
             let _ = write!(s, "; {} disconnects", self.disconnects);
@@ -203,6 +213,26 @@ mod tests {
         assert!(text.starts_with("loaded 0.00 s after reset from a UEFI shell; failed +0.00 s: bad?byte xxx"));
         assert!(text.len() <= MAX_LEN);
         assert!(text.is_ascii());
+    }
+
+    #[test]
+    fn dropped_reports_and_pairing_packets() {
+        let r = BootRecord {
+            loaded_at_ms: 9492,
+            ready_ms: Some(217),
+            connections: 2,
+            first_connection_ms: Some(486),
+            key_reports: 40,
+            pre_encryption_dropped: 3,
+            smp_dropped: 5,
+            os_started_ms: Some(24829),
+            ..BootRecord::default()
+        };
+        assert_eq!(
+            r.render(),
+            "loaded 9.49 s after reset by the firmware; ready +0.21 s; keyboard connected 2x, first +0.48 s; 40 key reports \
+             (3 from before encryption dropped); 5 pairing packets dropped; OS started +24.82 s"
+        );
     }
 
     #[test]

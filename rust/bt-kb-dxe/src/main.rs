@@ -13,9 +13,13 @@
 //!   about every 10 ms: drain HCI events, read ACL data (1 ms), run the
 //!   host stack until it is idle, decode key reports, repeat held keys.
 //! - **Keys:** read straight off the HCI link (ATT notifications on the
-//!   keyboard's input report, once the link is encrypted). The report
-//!   layout is remembered between boots (`cache`), so keys work about
-//!   0.5 s after the keyboard wakes rather than after the GATT discovery.
+//!   keyboard's input report), only once the link is encrypted with the
+//!   bonded key; reports from before that are dropped. The driver never
+//!   pairs: encryption with any other key and Security Manager traffic are
+//!   refused between the host stack and the controller (`uefi_bt::tap`).
+//!   The report layout is remembered between boots (`cache`), so keys work
+//!   about 0.5 s after the keyboard wakes rather than after the GATT
+//!   discovery.
 //! - **One copy:** a second load of the driver unloads itself again.
 //! - **Hand-off:** the controller goes back (keyboard disconnected,
 //!   HCI_Reset, Bluetooth function off) before an OS starts
@@ -71,7 +75,8 @@ use uefi::{CString16, Event, Handle, Identify};
 use uefi_bt::bond::{addr_text, ExportedBond};
 use uefi_bt::embassy::{Inbox, InboxTransport};
 use uefi_bt::keymap::{Event as KeyEvent, Key, KeyboardState};
-use uefi_bt::link::{encryption_change_as_v1, link_event, notification, LinkEvent};
+use uefi_bt::link::{encryption_change_as_v1, notification, Notification};
+use uefi_bt::tap::{BondKey, LinkGuard, LinkTap, SmpFilter, TapEvent, Verdict};
 use uefi_bt::{app, clock, DisconnectOutcome, HciError, UsbHci, ACL_BUF, HCI_OP_READ_BD_ADDR, MTK_VENDOR_ID};
 use uefi_raw::protocol::driver::{ComponentName2Protocol, DriverBindingProtocol};
 use uefi_raw::protocol::misc::ResetNotificationProtocol;
@@ -100,6 +105,11 @@ const BEFORE_EXIT_BOOT_SERVICES: Guid = guid!("8be0e274-3970-4b44-80c5-1ab9502f3
 const INSTANCE: Guid = guid!("8eba1571-1ea8-4ef1-af24-56a3bd1a4cf1");
 /// The connection handle the MT7922 gives the first LE link.
 const FIRST_LE_HANDLE: u16 = 0x0200;
+/// Deliver key reports that arrived before the link was encrypted, once it
+/// is (the behaviour before Nov 3). Off unless the driver is built with the
+/// `insecure-replay-unencrypted` feature: an unencrypted LE link has no
+/// integrity protection, so those reports may come from anyone in range.
+const REPLAY_UNENCRYPTED: bool = cfg!(feature = "insecure-replay-unencrypted");
 /// EFI_SHELL_PROTOCOL: present while a UEFI shell runs, so a driver loaded
 /// with it there was loaded from the shell, not by the firmware.
 const SHELL_PROTOCOL: Guid = guid!("6302d008-7f9b-4f30-87ac-60c9fef5da4e");
@@ -118,10 +128,6 @@ fn config() -> Option<&'static Config> {
     // SAFETY: only ever set to a leaked, never-freed Box.
     unsafe { CONFIG.load(Ordering::Acquire).as_ref() }
 }
-
-/// Notifications kept while the link isn't usable yet (first discovery
-/// takes about 2 s; fast typing gives about 20 reports a second).
-const STASH_LIMIT: usize = 128;
 
 /// How the firmware's timer and USB stack behave, for the log: the board's
 /// AMI stack may differ from OVMF's. Everything counts from the last timing
@@ -151,19 +157,12 @@ impl core::fmt::Display for Ms {
     }
 }
 
-/// What the driver sees on the raw link to the keyboard.
+/// The keyboard's current connection, for the log.
 #[derive(Default)]
-struct Tap {
-    conn: Option<u16>,
+struct Link {
     connected_ms: u64,
     /// The first key report of this connection was decoded.
     keys_flowing: bool,
-    encrypted: bool,
-    /// Notifications that arrived before encryption was reported or before
-    /// the report layout was known: replayed once both are there.
-    stash: Vec<(u16, Vec<u8>)>,
-    /// Some were dropped: a key release may be among them.
-    stash_overflowed: bool,
 }
 
 struct Driver {
@@ -173,9 +172,19 @@ struct Driver {
     future: Option<Pin<Box<dyn Future<Output = ()>>>>,
     timer: Option<Event>,
     child: Option<Child>,
-    tap: Tap,
+    /// What may become a keystroke: the link as the driver sees it, and the
+    /// guard the host stack's packets pass on their way to the controller.
+    tap: LinkTap,
+    guard: &'static LinkGuard,
+    /// Pairing (SMP) packets from the keyboard, kept from the host stack.
+    smp_in: SmpFilter,
+    link: Link,
+    /// Set while the controller is borrowed; acted on after the pump.
+    violation: Option<String>,
+    /// Refusals and SMP drops already logged.
+    refusals_logged: u32,
+    smp_logged: bool,
     keyboard: KeyboardState,
-    peer: [u8; 6],
     dead: bool,
     handed_off: bool,
     started_ms: u64,
@@ -536,7 +545,12 @@ fn start_driver(controller: Handle, agent: Handle) -> Result<(), Status> {
     let inbox: &'static Inbox = Box::leak(Box::default());
     let shared: &'static Shared = Box::leak(Box::default());
     let resources: &'static mut HostResources<Pool, 1, 4> = Box::leak(Box::new(HostResources::new()));
-    let controller_hci: Ctrl = ExternalController::new(InboxTransport::new(hci, inbox));
+    let guard: &'static LinkGuard =
+        Box::leak(Box::new(LinkGuard::new(BondKey::new(cfg.bond.ediv, cfg.bond.rand_bytes(), cfg.bond.ltk))));
+    let controller_hci: Ctrl = ExternalController::new(InboxTransport::new(hci, inbox).with_guard(guard));
+    if REPLAY_UNENCRYPTED {
+        warn!("built with insecure-replay-unencrypted: key reports from before the link is encrypted are delivered");
+    }
     let stack: &'static Stack<'static, Ctrl, Pool> = Box::leak(Box::new(trouble_host::new(controller_hci, resources).build()));
     if let Err(e) = stack.add_bond_information(bond_information(&cfg.bond)) {
         error!("importing the bond failed: {e:?}");
@@ -592,9 +606,14 @@ fn start_driver(controller: Handle, agent: Handle) -> Result<(), Status> {
             future: Some(future),
             timer: Some(timer),
             child: Some(child),
-            tap: Tap::default(),
+            tap: LinkTap::new(cfg.bond.peer, cfg.bond.peer_is_random, REPLAY_UNENCRYPTED),
+            guard,
+            smp_in: SmpFilter::default(),
+            link: Link::default(),
+            violation: None,
+            refusals_logged: 0,
+            smp_logged: false,
             keyboard: KeyboardState::default(),
-            peer: cfg.bond.peer,
             dead: false,
             handed_off: false,
             started_ms: clock::now_ms(),
@@ -787,6 +806,7 @@ impl Driver {
             self.fail(&why);
             return;
         }
+        self.log_guard();
         // SetState from ConSplitter (another keyboard's Caps Lock, say).
         if let Some(toggles) = textin::CONSOLE.with(|c| c.requested_toggles.take()) {
             if toggles != self.keyboard.toggles {
@@ -795,7 +815,10 @@ impl Driver {
             }
         }
         self.replay(now);
-        if let Err(why) = self.poll_session() {
+        let polled = self.poll_session();
+        // A refused command stops the host stack in this very poll.
+        self.log_guard();
+        if let Err(why) = polled {
             self.fail(&why);
             return;
         }
@@ -837,6 +860,20 @@ impl Driver {
         }
     }
 
+    /// What the guard refused or dropped since the last call.
+    fn log_guard(&mut self) {
+        let (refused, why) = self.guard.refused();
+        if refused > self.refusals_logged {
+            self.refusals_logged = refused;
+            error!("refused to send the controller {}", why.unwrap_or("a command"));
+        }
+        let smp = self.smp_in.dropped + self.guard.smp_dropped();
+        if smp > 0 && !self.smp_logged {
+            self.smp_logged = true;
+            warn!("dropped a pairing (SMP) packet: this driver only uses the stored key, so it never pairs (counted in the timing lines)");
+        }
+    }
+
     /// Everything the controller has: events into the tap and the inbox,
     /// ACL data likewise (every tick while connected, else every 100 ms).
     fn pump(&mut self, now: u64) -> Result<(), String> {
@@ -862,7 +899,10 @@ impl Driver {
                 Err(e) => return Err(alloc::format!("reading HCI events failed: {e:?}")),
             }
         }
-        if self.tap.conn.is_none() && now < self.next_idle_acl_ms {
+        if let Some(why) = self.violation.take() {
+            return Err(why);
+        }
+        if self.tap.conn().is_none() && now < self.next_idle_acl_ms {
             return Ok(());
         }
         self.next_idle_acl_ms = now + IDLE_ACL_INTERVAL_MS;
@@ -889,14 +929,19 @@ impl Driver {
                     }
                     AclKind::Data { .. } if acl.stored == acl.len => {
                         let packet = &buf[..acl.len];
-                        self.tap_acl(packet, now);
+                        // The keyboard's pairing packets never reach the
+                        // host stack (see `uefi_bt::tap`).
+                        if !self.smp_in.pass(packet) {
+                            continue;
+                        }
                         // Notifications are the tap's alone: the host stack
                         // has no subscriber for them, and queued unread they
                         // used up its packet pool (OutOfMemory, Nov 2). Its
                         // controller-to-host flow control is off, so nothing
                         // needs acknowledging.
-                        if notification(packet).is_some() {
+                        if let Some(n) = notification(packet) {
                             self.timing.notifications += 1;
+                            self.tap_notification(&n, now);
                         } else {
                             self.inbox.push_acl(packet);
                         }
@@ -911,10 +956,11 @@ impl Driver {
     }
 
     fn tap_event(&mut self, event: &[u8], now: u64) {
-        match link_event(event) {
-            Some(LinkEvent::Connected { handle, peer, .. }) if peer == self.peer => {
+        let Some(change) = self.tap.on_event(event, self.guard) else { return };
+        match change {
+            TapEvent::Connected { handle } => {
                 info!("keyboard connected (handle {handle:#06x})");
-                self.tap = Tap { conn: Some(handle), connected_ms: now, ..Tap::default() };
+                self.link = Link { connected_ms: now, keys_flowing: false };
                 self.shared.encrypted.set(None);
                 self.ever_connected = true;
                 record::update(|r| {
@@ -924,7 +970,7 @@ impl Driver {
                 });
                 self.timing_due = Some("until connected");
             }
-            Some(LinkEvent::ConnectFailed { status }) => {
+            TapEvent::ConnectFailed { status } => {
                 let what = match status {
                     0x02 => "cancelled",
                     0x3E => "the link failed to come up",
@@ -932,75 +978,79 @@ impl Driver {
                 };
                 info!("a connection attempt ended without a connection (status {status:#04x}: {what})");
             }
-            Some(LinkEvent::Encryption { handle, on, v2 }) if Some(handle) == self.tap.conn => {
+            TapEvent::Encrypted { handle, v2, dropped } => {
                 let event = if v2 { "Encryption Change v2, passed on as v1" } else { "Encryption Change v1" };
-                info!("keyboard link {} ({event})", if on { "encrypted" } else { "no longer encrypted" });
-                self.tap.encrypted = on;
-                self.shared.encrypted.set(on.then_some(handle));
+                info!("keyboard link encrypted with the bonded key ({event})");
+                if dropped > 0 {
+                    warn!("dropped {dropped} key reports that arrived before the link was encrypted");
+                }
+                self.shared.encrypted.set(Some(handle));
                 record::update(|r| {
                     r.encryption_v2.get_or_insert(v2);
+                    r.pre_encryption_dropped += dropped;
                     false
                 });
-                if on {
-                    // Bring the keyboard's LEDs in line with our lock state.
-                    self.shared.leds.set(Some(self.keyboard.toggles.led_bits()));
-                    self.replay(now);
-                }
+                // Bring the keyboard's LEDs in line with our lock state.
+                self.shared.leds.set(Some(self.keyboard.toggles.led_bits()));
+                self.replay(now);
             }
-            Some(LinkEvent::Disconnected { handle, reason }) if Some(handle) == self.tap.conn => {
+            TapEvent::Untrusted { handle } => {
+                self.shared.encrypted.set(None);
+                self.violation = Some(alloc::format!(
+                    "the controller reports the keyboard link ({handle:#06x}) encrypted, but not after a start with the bonded key"
+                ));
+            }
+            TapEvent::EncryptionOff { .. } => {
+                info!("keyboard link no longer encrypted: key reports are dropped until it is again");
+                self.shared.encrypted.set(None);
+                self.keyboard.release_all();
+            }
+            TapEvent::Disconnected { reason, dropped, .. } => {
                 info!("keyboard disconnected (reason {reason:#04x}) after {} key reports", self.reports);
-                self.tap = Tap::default();
+                if dropped > 0 {
+                    warn!("{dropped} key reports arrived on that connection before it was encrypted, and were dropped");
+                }
                 self.shared.encrypted.set(None);
                 self.keyboard.release_all();
                 record::update(|r| {
                     r.disconnects += 1;
                     r.last_disconnect_reason = Some(reason);
+                    r.pre_encryption_dropped += dropped;
                     true
                 });
                 self.timing_due = Some("while connected");
             }
-            _ => {}
         }
     }
 
-    fn tap_acl(&mut self, packet: &[u8], now: u64) {
-        let Some(n) = notification(packet) else { return };
-        if Some(n.conn) != self.tap.conn {
-            return;
-        }
-        match (self.tap.encrypted, self.shared.layout.get()) {
-            (true, Some(layout)) => {
-                if n.attribute == layout.input {
-                    self.key_report(layout, n.value, now);
-                } else {
-                    self.other_report(n.attribute, n.value);
-                }
-            }
-            _ => {
-                if self.tap.stash.len() < STASH_LIMIT {
-                    self.tap.stash.push((n.attribute, n.value.to_vec()));
-                } else {
-                    self.tap.stash_overflowed = true;
-                }
+    fn tap_notification(&mut self, n: &Notification<'_>, now: u64) {
+        let layout = self.shared.layout.get();
+        if let (Verdict::Deliver, Some(layout)) = (self.tap.on_notification(n, layout.is_some()), layout) {
+            if n.attribute == layout.input {
+                self.key_report(layout, n.value, now);
+            } else {
+                self.other_report(n.attribute, n.value);
             }
         }
     }
 
+    /// Reports that arrived on the encrypted link before the report layout
+    /// was known (first discovery, or a layout that changed).
     fn replay(&mut self, now: u64) {
-        if !self.tap.encrypted || self.tap.stash.is_empty() {
-            return;
-        }
         let Some(layout) = self.shared.layout.get() else { return };
-        let stash = core::mem::take(&mut self.tap.stash);
-        info!("replaying {} key reports that arrived during connection setup", stash.len());
-        for (attribute, value) in stash {
+        let Some(replay) = self.tap.take_replay(true) else { return };
+        if replay.unencrypted > 0 {
+            warn!("insecure-replay-unencrypted: delivering {} key reports from before the link was encrypted", replay.unencrypted);
+        }
+        info!("replaying {} key reports kept until the keyboard layout was known", replay.reports.len());
+        for (attribute, value) in replay.reports {
             if attribute == layout.input {
                 self.key_report(layout, &value, now);
             } else {
                 self.other_report(attribute, &value);
             }
         }
-        if core::mem::take(&mut self.tap.stash_overflowed) {
+        if replay.overflowed {
             // A dropped release would leave a key held and repeating: let
             // everything go; the keyboard's next report has the true state.
             warn!("too many key reports during connection setup; some were dropped");
@@ -1048,9 +1098,9 @@ impl Driver {
             r.first_keys_ms.get_or_insert(now);
             first
         });
-        if !self.tap.keys_flowing {
-            self.tap.keys_flowing = true;
-            info!("first key report decoded {} ms after the keyboard connected", now.saturating_sub(self.tap.connected_ms));
+        if !self.link.keys_flowing {
+            self.link.keys_flowing = true;
+            info!("first key report decoded {} ms after the keyboard connected", now.saturating_sub(self.link.connected_ms));
             self.timing_due = Some("connection setup");
         }
         let shared = self.shared;
@@ -1114,6 +1164,10 @@ impl Driver {
         if dropped > 0 {
             let _ = write!(line, "; {dropped} packets dropped from the host stack's inbox");
         }
+        let smp = self.smp_in.dropped + self.guard.smp_dropped();
+        if smp > 0 {
+            let _ = write!(line, "; {smp} pairing (SMP) packets dropped");
+        }
         info!("{line}");
         // Keep measuring tick gaps across the line.
         self.timing.last_tick_us = t.last_tick_us;
@@ -1130,11 +1184,18 @@ impl Driver {
             let _ = boot::set_timer(timer, TimerTrigger::Cancel);
         }
         self.keyboard.release_all();
+        // No encryption can be started with the bonded key after this.
+        self.guard.wipe();
+        let smp = self.smp_in.dropped + self.guard.smp_dropped();
+        record::update(|r| {
+            r.smp_dropped = smp;
+            false
+        });
         let Ok(mut hci) = self.hci.try_borrow_mut() else {
             error!("the controller is in use; not handing it back");
             return;
         };
-        if let Some(handle) = self.tap.conn.take() {
+        if let Some(handle) = self.tap.conn() {
             info!("disconnecting the keyboard (handle {handle:#06x})");
             let [lo, hi] = handle.to_le_bytes();
             // HCI_Disconnect, reason 0x15: remote device terminated (power off).

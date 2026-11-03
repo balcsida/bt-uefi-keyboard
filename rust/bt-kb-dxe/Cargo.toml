@@ -6,6 +6,13 @@ authors.workspace = true
 version.workspace = true
 build = "build.rs"
 
+[features]
+# Deliver key reports that arrived before the link was encrypted, once it is
+# (the behaviour before Nov 3). Insecure: an unencrypted LE link has no
+# integrity protection, so anyone in radio range could inject those. For
+# experiments only; never in a build you install (see README, Security).
+insecure-replay-unencrypted = []
+
 [dependencies]
 mtk-bt = { path = "../mtk-bt" }
 uefi-bt = { path = "../uefi-bt", features = ["embassy", "panic-handler"] }

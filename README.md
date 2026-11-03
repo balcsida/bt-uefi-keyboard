@@ -132,7 +132,67 @@ out of git:
 - **ACL pipe:** events come through an asynchronous interrupt transfer, but the ACL pipe is still read with 1 ms synchronous bulk transfers. In QEMU those can lose data when a transfer is cancelled. That's fine while ACL data is only drained, but connections (milestone 3) need a better way; UEFI's USB I/O has no async bulk transfer.
 - **Event throughput:** the async pipe gets one 16-byte packet per firmware timer tick, about 100 packets/s with a 10 ms tick. Scans therefore use duplicate filtering (`-dups` turns it off).
 - **Wedge recovery untested:** the MT7922 subsystem reset (`-recover`) is Linux's recovery after a firmware crash. Whether it revives a controller that has stopped answering HCI is untested.
-- **Untested security path:** TrouBLE's security manager (`security` feature) hasn't been tried. It is needed to start encryption with the keyboard's stored key in milestone 3.
+- **Security:** see [Security](#security) for the threat model, what the driver does about it, and what remains.
+
+## Security
+
+### Threat model
+
+- **Root (or an administrator in Windows) can always read the keyboard's
+  link key** from BlueZ (`/var/lib/bluetooth`) or Windows. Hiding the key
+  from them is not a goal.
+- **Goals:**
+  1. Root can't make the firmware run different pre-boot code, or trust a
+     different keyboard, without a key that isn't on this machine.
+  2. No plaintext link key (LTK) at rest outside the encrypted root file
+     system. Before the hardening, the `.bond` file sat on the FAT ESP.
+  3. With a TPM, the stored key is sealed: useless off this machine, and
+     not unsealable once the OS is running.
+  4. Nothing received before the link is encrypted is ever delivered as a
+     keystroke.
+  5. An attacker in radio range without the LTK can't inject keys; at worst
+     they can deny service.
+
+### What each stage protects against
+
+| Stage | Protects against | State |
+| --- | --- | --- |
+| 1. The link (`uefi-bt/src/tap.rs`) | **Goal 4:** reports that arrive before encryption are dropped and counted, not replayed once the link is encrypted. **Goal 5:** the driver never pairs; it refuses LE Enable Encryption with any key but the bonded one, and drops Security Manager (SMP) packets both ways. Without that, TrouBLE 0.8 starts a fresh Just Works pairing when the bonded key fails, so a device answering with the keyboard's address could pair and type. | Done (Nov 3); host tests |
+
+- **When keys count:** the tap treats the link as encrypted only after an
+  Encryption Change (v1 or v2) with status 0x00 and encryption on. It must
+  be for the connection to the bonded address and address type, with this
+  PC as the central, and follow an LE Enable Encryption with the bonded
+  key on that connection.
+- **The host stack's word alone doesn't count:** TrouBLE 0.8 reports a
+  resumed bond with the same PairingComplete event as a fresh pairing. The
+  session goes on once the tap has seen the encryption with the bonded
+  key, and ends if the host stack reports one the tap didn't see.
+- **Pre-encryption reports:** those that arrive on the encrypted link
+  before the report layout is known are kept and delivered once it is.
+  Those that arrive before encryption are dropped. Since HCI events and ACL
+  data travel on different USB endpoints, a report sent just after
+  encryption can still overtake its Encryption Change event. Such a report,
+  usually the key that woke the keyboard, is lost too.
+- **Opt-in: `insecure-replay-unencrypted`.** Building the driver with
+  `cargo build -p bt-kb-dxe --features insecure-replay-unencrypted` brings
+  back the old behaviour: pre-encryption reports are delivered once the
+  link is encrypted. An unencrypted LE link has no integrity protection,
+  so anyone in radio range can inject into that window. For experiments
+  only; the driver logs a warning at every start when built this way.
+
+### Residual risks
+
+- **A keystroke in firmware no longer proves physical presence.** Anyone
+  who has the LTK can type into setup from radio range.
+- **Legacy pairing:** this keyboard bonds with LE legacy pairing. An
+  attacker who recorded the original pairing can recover the LTK offline
+  (as with crackle), and then counts as the keyboard.
+- **Radio-facing parsing in firmware:** HCI events and ACL data from the
+  radio are parsed in pre-boot firmware: by the driver, TrouBLE and bt-hci.
+  Rust keeps that memory-safe, and events are validated before TrouBLE
+  sees them, but a parser panic still restarts the machine (denial of
+  service).
 
 ## License
 

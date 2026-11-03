@@ -22,6 +22,7 @@ pub mod keymap;
 pub mod link;
 pub mod logbuf;
 pub mod pipe;
+pub mod tap;
 pub mod trace;
 
 use alloc::boxed::Box;

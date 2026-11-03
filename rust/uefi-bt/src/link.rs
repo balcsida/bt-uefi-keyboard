@@ -6,8 +6,9 @@
 /// A link-level fact from one HCI event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkEvent {
-    /// LE (Enhanced) Connection Complete with success.
-    Connected { handle: u16, peer: [u8; 6], peer_random: bool },
+    /// LE (Enhanced) Connection Complete with success. `central`: this
+    /// controller is the central (it initiated the connection).
+    Connected { handle: u16, peer: [u8; 6], peer_random: bool, central: bool },
     /// LE (Enhanced) Connection Complete with an error: the attempt ended
     /// without a connection (0x02 after a cancel, 0x3E if the link failed
     /// to come up).
@@ -38,7 +39,7 @@ pub fn link_event(event: &[u8]) -> Option<LinkEvent> {
         0x3E if params.len() >= 12 && matches!(params[0], 0x01 | 0x0A | 0x29) && params[1] == 0 => {
             let mut peer = [0u8; 6];
             peer.copy_from_slice(&params[6..12]);
-            Some(LinkEvent::Connected { handle: handle_at(2)?, peer, peer_random: params[5] & 0x01 != 0 })
+            Some(LinkEvent::Connected { handle: handle_at(2)?, peer, peer_random: params[5] & 0x01 != 0, central: params[4] == 0 })
         }
         0x3E if params.len() >= 2 && matches!(params[0], 0x01 | 0x0A | 0x29) && params[1] != 0 => {
             Some(LinkEvent::ConnectFailed { status: params[1] })
@@ -131,7 +132,7 @@ mod tests {
         ];
         assert_eq!(
             link_event(&conn),
-            Some(LinkEvent::Connected { handle: 0x200, peer: [0x01, 0x00, 0x00, 0x00, 0x00, 0xC0], peer_random: true })
+            Some(LinkEvent::Connected { handle: 0x200, peer: [0x01, 0x00, 0x00, 0x00, 0x00, 0xC0], peer_random: true, central: true })
         );
         assert_eq!(link_event(&[0x08, 0x04, 0x00, 0x00, 0x02, 0x01]), Some(LinkEvent::Encryption { handle: 0x200, on: true, v2: false }));
         // Version 2 adds the key size (16 here).

@@ -16,6 +16,7 @@ use bt_hci_transport::ReadHciError;
 use mtk_bt::AclKind;
 use uefi::Status;
 
+use crate::tap::LinkGuard;
 use crate::{HciError, UsbError, UsbHci, ACL_BUF};
 
 struct UefiTimeDriver;
@@ -52,6 +53,8 @@ pub enum TransportError {
     Unsupported,
     /// A MediaTek crash dump arrived: the controller firmware is gone.
     FirmwareCrashed,
+    /// The link guard refused to send the command (see `tap::LinkGuard`).
+    Refused,
 }
 
 /// What to do with connection data from the ACL pipe. The pipe is read in
@@ -229,15 +232,22 @@ impl Inbox {
 }
 
 /// `bt-hci` transport for the driver: reads come from an [`Inbox`] that the
-/// timer tick fills, writes go straight to the controller.
+/// timer tick fills, writes go straight to the controller, through the
+/// [`LinkGuard`] if there is one: it refuses encryption with any key but
+/// the bonded one, and drops pairing (SMP) packets.
 pub struct InboxTransport<'a> {
     hci: &'a RefCell<UsbHci>,
     inbox: &'a Inbox,
+    guard: Option<&'a LinkGuard>,
 }
 
 impl<'a> InboxTransport<'a> {
     pub fn new(hci: &'a RefCell<UsbHci>, inbox: &'a Inbox) -> Self {
-        Self { hci, inbox }
+        Self { hci, inbox, guard: None }
+    }
+
+    pub fn with_guard(self, guard: &'a LinkGuard) -> Self {
+        Self { guard: Some(guard), ..self }
     }
 }
 
@@ -263,6 +273,18 @@ impl Transport for InboxTransport<'_> {
             return Err(TransportError::Unsupported);
         }
         tx.write_hci(&mut buf[..size]).map_err(|_| TransportError::Parse)?;
+        let packet = &buf[..size];
+        if let Some(guard) = self.guard {
+            match P::KIND {
+                // Refused: the host stack gets an error and stops, so the
+                // driver fails closed.
+                PacketKind::Cmd if !guard.allow_command(packet) => return Err(TransportError::Refused),
+                // Dropped silently: a pairing that never gets an answer
+                // times out.
+                PacketKind::AclData if !guard.allow_acl(packet) => return Ok(()),
+                _ => {}
+            }
+        }
         let mut hci = self.hci.try_borrow_mut().map_err(|_| TransportError::Unsupported)?;
         self.inbox.writes.set(self.inbox.writes.get().wrapping_add(1));
         match P::KIND {
