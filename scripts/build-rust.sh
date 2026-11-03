@@ -18,6 +18,9 @@ BT_KB_FIRMWARE="$FW_BIN" BT_KB_BOND_DIGESTS="$digests" cargo build --release --t
   -p bt-hci-probe -p bt-le-scan -p bt-kb-probe -p bt-kb-dxe -p bt-kb-log -p ebs-test 2>&1 | grep -E '^(warning|error)' || true
 sha256sum "$FW_BIN" | cut -d' ' -f1 > "$RUST_EFI_DIR/bt-kb-dxe.firmware.sha256"
 printf '%s\n' $digests > "$RUST_EFI_DIR/bt-kb-dxe.bonds"
+# The spare PCR the driver extends (bt-kb-dxe/build.rs; BT_KB_SPARE_PCR),
+# for scripts/tpm-seal.sh.
+echo "spare_pcr=${BT_KB_SPARE_PCR:-8}" > "$RUST_EFI_DIR/bt-kb-dxe.tpm"
 count="$(grep -c . "$RUST_EFI_DIR/bt-kb-dxe.bonds" || true)"
 if [ "$count" = 0 ]; then
   echo "bt-kb-dxe trusts no bond: export one first (sudo scripts/export-bond.sh), then build again"

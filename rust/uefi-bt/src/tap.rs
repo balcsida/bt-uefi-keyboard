@@ -34,6 +34,12 @@ const OP_LE_ENABLE_ENCRYPTION: u16 = 0x2019;
 const OP_LE_LTK_REQUEST_REPLY: u16 = 0x201A;
 const CID_SMP: u16 = 0x0006;
 
+/// What the host stack (TrouBLE) holds in place of the link key. The guard
+/// puts the real key into LE Enable Encryption on its way to the
+/// controller ([`LinkGuard::allow_command`]), so the host stack's memory,
+/// which the driver can't wipe when the OS starts, never has it.
+pub const STAND_IN_LTK: [u8; 16] = *b"bt-kb-dxe:no-ltk";
+
 /// The bonded key, as LE Enable Encryption carries it (HCI byte order).
 pub struct BondKey {
     ediv: u16,
@@ -81,7 +87,8 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandCheck {
     Pass,
-    /// LE Enable Encryption with the bonded key, for this connection.
+    /// LE Enable Encryption with the bonded EDIV and Rand and the stand-in
+    /// key, for this connection: sent with the real key in its place.
     BondedEncryption { handle: u16 },
     /// Not sent.
     Refuse(&'static str),
@@ -100,7 +107,7 @@ pub fn check_command(cmd: &[u8], key: &BondKey) -> CommandCheck {
             let bonded = key.live
                 & ct_eq(&params[2..10], &key.rand)
                 & ct_eq(&params[10..12], &key.ediv.to_le_bytes())
-                & ct_eq(&params[12..28], &key.ltk);
+                & ct_eq(&params[12..28], &STAND_IN_LTK);
             if bonded {
                 CommandCheck::BondedEncryption { handle }
             } else {
@@ -187,10 +194,15 @@ impl LinkGuard {
     }
 
     /// For the transport: whether to send this HCI command.
-    pub fn allow_command(&self, cmd: &[u8]) -> bool {
-        match check_command(cmd, &self.key.borrow()) {
+    /// For the transport: whether to send this command. LE Enable
+    /// Encryption for the bond gets the real key in place of the stand-in
+    /// here; the transport wipes the packet once it's sent.
+    pub fn allow_command(&self, cmd: &mut [u8]) -> bool {
+        let key = self.key.borrow();
+        match check_command(cmd, &key) {
             CommandCheck::Pass => true,
             CommandCheck::BondedEncryption { handle } => {
+                cmd[15..31].copy_from_slice(&key.ltk);
                 self.bonded_start.set(Some(handle));
                 true
             }
@@ -447,13 +459,18 @@ mod tests {
         vec![0x05, 0x04, 0x00, lo, hi, reason]
     }
 
-    /// LE Enable Encryption as TrouBLE sends it.
+    /// LE Enable Encryption as TrouBLE sends it: the bond's EDIV and Rand,
+    /// the stand-in key.
     fn enable_encryption(handle: u16, k: &BondKey) -> Vec<u8> {
+        enable_encryption_with(handle, k, &STAND_IN_LTK)
+    }
+
+    fn enable_encryption_with(handle: u16, k: &BondKey, ltk: &[u8; 16]) -> Vec<u8> {
         let mut c = vec![0x19, 0x20, 28];
         c.extend_from_slice(&handle.to_le_bytes());
         c.extend_from_slice(&k.rand);
         c.extend_from_slice(&k.ediv.to_le_bytes());
-        c.extend_from_slice(&k.ltk);
+        c.extend_from_slice(ltk);
         c
     }
 
@@ -468,23 +485,38 @@ mod tests {
         let guard = LinkGuard::new(key());
         let mut tap = LinkTap::new(PEER, true, replay);
         assert_eq!(tap.on_event(&connected(H, 0, 1, PEER), &guard), Some(TapEvent::Connected { handle: H }));
-        assert!(guard.allow_command(&enable_encryption(H, &key())));
+        assert!(guard.allow_command(&mut enable_encryption(H, &key())));
         assert_eq!(tap.on_event(&enc_change(0, H, 1), &guard), Some(TapEvent::Encrypted { handle: H, v2: false, dropped: 0 }));
         (tap, guard)
+    }
+
+    #[test]
+    fn the_guard_puts_the_real_key_in() {
+        let guard = LinkGuard::new(key());
+        let mut cmd = enable_encryption(H, &key());
+        assert!(guard.allow_command(&mut cmd));
+        assert_eq!(cmd, enable_encryption_with(H, &key(), &key().ltk));
+        // Refused commands are left alone.
+        let mut wrong = enable_encryption_with(H, &key(), &[0x0E; 16]);
+        assert!(!guard.allow_command(&mut wrong));
+        assert_eq!(&wrong[15..31], &[0x0E; 16]);
     }
 
     #[test]
     fn enable_encryption_only_with_the_bonded_key() {
         let k = key();
         assert_eq!(check_command(&enable_encryption(H, &k), &k), CommandCheck::BondedEncryption { handle: H });
-        // An STK from a fresh pairing (EDIV and Rand zero), another LTK,
-        // another EDIV, another Rand: all refused.
+        // An STK from a fresh pairing (EDIV and Rand zero), another EDIV,
+        // another Rand: all refused. So is any key but the stand-in, the
+        // real one included: the host stack never has it.
         let stk = BondKey::new(0, [0; 8], [0x55; 16]);
-        let other_ltk = BondKey::new(0x1234, [1, 2, 3, 4, 5, 6, 7, 8], [0x0E; 16]);
         let other_ediv = BondKey::new(0x1235, [1, 2, 3, 4, 5, 6, 7, 8], [0x0F; 16]);
         let other_rand = BondKey::new(0x1234, [1, 2, 3, 4, 5, 6, 7, 9], [0x0F; 16]);
-        for wrong in [stk, other_ltk, other_ediv, other_rand] {
+        for wrong in [stk, other_ediv, other_rand] {
             assert!(matches!(check_command(&enable_encryption(H, &wrong), &k), CommandCheck::Refuse(_)));
+        }
+        for ltk in [k.ltk, [0x0E; 16], [0; 16]] {
+            assert!(matches!(check_command(&enable_encryption_with(H, &k, &ltk), &k), CommandCheck::Refuse(_)));
         }
         // Truncated; peripheral-side LTK reply; anything else passes.
         assert!(matches!(check_command(&enable_encryption(H, &k)[..20], &k), CommandCheck::Refuse(_)));
@@ -532,7 +564,7 @@ mod tests {
         // No bonded start on this connection yet: not trusted.
         assert_eq!(tap.on_event(&enc_change(0, H, 1), &guard), Some(TapEvent::Untrusted { handle: H }));
         assert!(!tap.encrypted());
-        assert!(guard.allow_command(&enable_encryption(H, &key())));
+        assert!(guard.allow_command(&mut enable_encryption(H, &key())));
         // A failure status, or encryption off: not encrypted.
         assert_eq!(tap.on_event(&enc_change(0x06, H, 0), &guard), None);
         assert_eq!(tap.on_event(&enc_change(0x06, H, 1), &guard), None);
@@ -585,7 +617,7 @@ mod tests {
         let n = notification(&early).unwrap();
         assert_eq!(tap.on_notification(&n, true), Verdict::DroppedUnencrypted);
         assert_eq!(tap.on_notification(&n, false), Verdict::DroppedUnencrypted);
-        guard.allow_command(&enable_encryption(H, &key()));
+        guard.allow_command(&mut enable_encryption(H, &key()));
         assert_eq!(tap.on_event(&enc_change(0, H, 1), &guard), Some(TapEvent::Encrypted { handle: H, v2: false, dropped: 2 }));
         // Nothing to replay: they are gone.
         assert!(tap.take_replay(true).is_none());
@@ -618,7 +650,7 @@ mod tests {
         assert_eq!(tap.on_notification(&notification(&early).unwrap(), true), Verdict::Stashed);
         // Not delivered before encryption, not even with the feature.
         assert!(tap.take_replay(true).is_none());
-        guard.allow_command(&enable_encryption(H, &key()));
+        guard.allow_command(&mut enable_encryption(H, &key()));
         assert_eq!(tap.on_event(&enc_change(0, H, 1), &guard), Some(TapEvent::Encrypted { handle: H, v2: false, dropped: 0 }));
         let replay = tap.take_replay(true).unwrap();
         assert_eq!((replay.reports.len(), replay.unencrypted), (1, 1));
@@ -646,9 +678,9 @@ mod tests {
     fn a_wiped_key_matches_nothing() {
         let guard = LinkGuard::new(key());
         guard.wipe();
-        assert!(!guard.allow_command(&enable_encryption(H, &key())));
+        assert!(!guard.allow_command(&mut enable_encryption(H, &key())));
         // Not even the zeros the wipe left behind.
-        assert!(!guard.allow_command(&enable_encryption(H, &BondKey::new(0, [0; 8], [0; 16]))));
+        assert!(!guard.allow_command(&mut enable_encryption(H, &BondKey::new(0, [0; 8], [0; 16]))));
         assert_eq!(guard.refused().0, 2);
         assert_eq!(guard.bonded_start(), None);
     }

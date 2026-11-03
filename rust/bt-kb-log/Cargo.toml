@@ -9,3 +9,10 @@ version.workspace = true
 # The project's panic handler, as in the other apps.
 uefi-bt = { path = "../uefi-bt", features = ["panic-handler"] }
 uefi = { version = "0.41", features = ["alloc", "global_allocator"] }
+
+[features]
+# `btlog -unseal-test`: try to unseal bt-kb-dxe.sealed from the shell, after
+# the firmware's separators, and say whether the TPM refused (it must). For
+# the offline tests only (scripts/qemu-driver-test.sh): never in a build
+# that goes on a real ESP.
+unseal-test = []

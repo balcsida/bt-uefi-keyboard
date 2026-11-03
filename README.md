@@ -55,10 +55,13 @@ scripts/qemu-hw-kb.sh [-t 90]      # REAL CONTROLLER: milestone 3, connect to th
 LIVE=1 scripts/qemu-hw-kb.sh       # the same, showing the output in the terminal as it happens
 scripts/qemu-driver-test.sh        # driver, offline: self-test typing, no-device load + second load, panic,
                                    #   ExitBootServices, F2 hotkey at boot (Driver####), boot load without a device,
-                                   #   the board's diagnostics boot on a GPT disk, measured boot (TPM=1)
+                                   #   the board's diagnostics boot on a GPT disk, measured boot (TPM=1), a changed
+                                   #   firmware image, Secure Boot refusals (SB=1), bonds, the sealed bond (TPM=1)
                                    #   (ONLY="1 7" runs some)
 SB=1 TPM=1 scripts/qemu-driver-test.sh  # the same with Secure Boot on (test keys) and a TPM 2.0 (swtpm)
+scripts/tpm-host-test.sh           # the driver's TPM code (seal, unseal, refusals) against swtpm on the host
 scripts/eventlog.py driver FILE    # a TCG event log: where bt-kb-dxe loaded, separators, PCR 7 as it saw it
+scripts/eventlog.py predict FILE 2,7 --spare 8   # the PCR values the driver unseals with, and the policy digest
 scripts/bond-digest.py FILE.bond   # the digest a driver build pins for a bond (build-rust.sh pins qemu/keys/*.bond)
 scripts/qemu-hw-driver.sh [180]    # REAL CONTROLLER: driver loaded in the shell (QEMU window); end with ebs-test.efi or reset
 scripts/qemu-hw-boot.sh [240]      # REAL CONTROLLER: driver loaded at boot (Driver####, QEMU window, driver log in the
@@ -70,6 +73,9 @@ sudo scripts/board-install.sh      # REAL BOARD: driver + firmware image + bond 
                                    #   Boot on, refuses what doesn't verify (--dry-run shows the steps, --remove undoes it)
 scripts/secureboot-setup.sh        # REAL BOARD: the CachyOS sbctl flow as a checklist: what's done, what to run next;
                                    #   never enrolls keys or changes anything (--dry-run: just the steps; sudo: more checks)
+sudo scripts/tpm-seal.sh           # REAL BOARD: seal the bond to the TPM from this boot's event log (after a boot with
+                                   #   the driver; --dry-run, --if-needed, --no-fallback); scripts/systemd/ has a unit
+                                   #   that reseals at boot after a PCR change
 scripts/board-log.sh               # REAL BOARD: the driver's log of this boot, a timeline since the CPU reset (driver
                                    #   loaded, keyboard connected, hotkeys, boot loader, OS), this and the previous
                                    #   boot's one-line records (BtKbLastBoot), its variables, Linux's setup; for a
@@ -174,7 +180,7 @@ out of git:
 | 1. The link (`uefi-bt/src/tap.rs`) | **Goal 4:** reports that arrive before encryption are dropped and counted, not replayed once the link is encrypted. **Goal 5:** the driver never pairs; it refuses LE Enable Encryption with any key but the bonded one, and drops Security Manager (SMP) packets both ways. Without that, TrouBLE 0.8 starts a fresh Just Works pairing when the bonded key fails, so a device answering with the keyboard's address could pair and type. | Done (Nov 3); host tests |
 | 2. Secure Boot and the firmware image | **Goal 1**, as far as Secure Boot reaches: with your own keys enrolled (sbctl), the firmware runs bt-kb-dxe only if your db key signed it, and refuses a replaced or tampered driver; the boot goes on without it. The MT7922 firmware image next to the driver, which Secure Boot doesn't cover, must match the SHA-256 the driver was built with, or the driver refuses it before parsing it. | Done offline (Nov 3): the Secure Boot tests pass with signed images (sbsign) and with hashes in db |
 | 3. Bonds (`bt-kb-dxe/src/bondstore.rs`) | **Goal 1** for the keyboard: a build trusts only the bonds whose digests it was built with, so a bond file dropped on the ESP for another device is ignored. **Goal 2** without a TPM: the driver moves a trusted bond file into a variable the OS can't read or write (`BtKbBond`, no RUNTIME_ACCESS) and deletes the file from the ESP. No variable the OS can read holds key material. | Done offline (Nov 3) |
-| 4. TPM sealing | **Goal 3:** the stored key sealed to the TPM, useless off this machine and not unsealable once the OS runs. | Not started: needs swtpm and tpm2-tools to test, and a decision on its default policy. PCR 7's value before its separator is never what PCR 7 holds when a Driver#### runs, because EDK2 measures that separator before any image is verified, as the TCG spec requires. |
+| 4. TPM sealing (`uefi-bt/src/seal.rs`, `bt-kb-dxe/src/sealed.rs`) | **Goal 3:** the bond sealed to the TPM with a policy over PCR 2, PCR 7 and a spare PCR as the driver sees them: useless on another machine or after a TPM clear, and neither the OS nor anything else that runs after the driver can unseal it. Unsealed over a salted session with an encrypted, HMAC-checked answer; the host stack never holds the key. | Done offline (Nov 3): against swtpm on the host, and in OVMF with swtpm (eight boots). Not yet on the board. |
 
 - **When keys count:** the tap treats the link as encrypted only after an
   Encryption Change (v1 or v2) with status 0x00 and encryption on. It must
@@ -284,8 +290,88 @@ out of git:
     test key, in either byte order; `BtKbBond` does.
 - **Key copies in memory:** the driver wipes its copy of the key at
   BeforeExitBootServices, because the OS gets boot services memory as it
-  is. The guard's copy goes at the hand-off. TrouBLE's own copy of the bond
-  is stage 4's job.
+  is. The guard's copy goes at the hand-off, and TrouBLE never has one
+  (see stage 4).
+
+### TPM sealing (stage 4)
+
+- **What's sealed:** the bond's 42-byte record, under the storage root key
+  at 0x81000001. That's systemd's key; `tpm-seal.sh` creates it from the
+  same template if it's missing. `bt-kb-dxe.sealed` on the ESP holds only
+  the sealed object's public and private parts, the expected PCR values,
+  the policy digest and the bond's digest; nothing in it is secret. The
+  record reaches `tpm2_create` through a pipe.
+- **The policy:** one TPM2_PolicyPCR over PCR 2, PCR 7 and the spare PCR
+  (8, or `BT_KB_SPARE_PCR` at build time), with the values they have while
+  the driver runs.
+  - **PCR 2** holds the driver's own load measurement, and its separator
+    comes after the driver, in EDK2 and on this board. No OS ever sees that
+    value, with the driver or without it, and no other Driver#### does.
+  - **PCR 7** is the Secure Boot state: SecureBoot, PK, KEK, db, dbx and,
+    with Secure Boot on, the db entry that verified the driver. On this
+    board its separator also comes after the driver (seen with Secure Boot
+    off). EDK2 measures it before any image runs.
+  - **The spare PCR** must be zero. The driver extends it on every boot
+    with a TPM, right after it tried to unseal, and logs that as an
+    EV_EFI_ACTION. Nothing that runs later can unseal: an app started from
+    setup, the boot loader, the OS. Its number is a build setting, so
+    whoever can write the ESP can't make the driver skip it.
+  - **Where the values come from:** `scripts/eventlog.py predict` replays
+    this boot's event log up to the driver's load event. In place of the
+    logged image hash it uses that of the driver the next boot runs
+    (`eventlog.py pehash`: the Authenticode hash firmware measures).
+    `tpm-seal.sh` checks the policy digest against `tpm2_policypcr`'s, and
+    refuses values the TPM has right now.
+  - **Why not PCR 7 before its separator alone:** with this board's order
+    it would hold, but in EDK2 PCR 7's separator comes first. And PCR 7
+    doesn't change when the driver is left out. An image signed with the
+    same db key run as a Driver#### (Limine, say) would see the same PCR 7,
+    and could start an OS before the separators. PCR 2 and the spare PCR
+    close that.
+- **The session:** a policy session salted with an ECDH secret for the
+  storage key (P-256), so someone reading the TPM's bus learns nothing.
+  Unseal carries the command HMAC, and the answer comes back XOR-encrypted
+  with the session key and is HMAC-checked. The random numbers mix
+  RDSEED/RDRAND, the firmware's RNG and the TPM's. The unsealed record must
+  still be a bond the build trusts (stage 3).
+- **When unsealing fails** (a dbx or key update, a firmware update, a new
+  option ROM, a TPM clear), the driver:
+  - logs why and which PCRs changed;
+  - records it in `BtKbLastBoot` ("unseal failed: …");
+  - uses its boot-services copy (stage 3).
+
+  `tpm-seal.sh --if-needed` then reseals from that boot's event log, and
+  the next boot unseals again. `scripts/systemd/bt-kb-reseal.service` runs
+  it at every boot. `board-install.sh` reseals right away for a new driver
+  build.
+- **`--no-fallback`:** the stage 3 copy is a plaintext key in the
+  firmware's variable store. The OS can't read it, but whoever dumps the
+  SPI flash can. `tpm-seal.sh --no-fallback` writes `fallback=no`. The
+  driver then deletes `BtKbBond` and imports no bond file, and
+  `board-install.sh` stops copying one, so the key is only in the sealed
+  object. The price: after a PCR change, one boot without the Bluetooth
+  keyboard, until the reseal.
+- **No TPM:** stage 3, as before.
+- **The host stack never holds the key:** TrouBLE gets a stand-in. The
+  link guard puts the real key into LE Enable Encryption on its way to the
+  controller, and the transport wipes the packet. The driver runs at every
+  boot, so this matters: an OS booted from a USB stick gets the
+  boot-services memory, and finds no copy there.
+- **Tests:**
+  - **`scripts/tpm-host-test.sh`:** the driver's unseal code against
+    libtpms (swtpm) on the host. It unseals and the answer's HMAC checks.
+    A changed PCR, a corrupted private part and another storage key are
+    refused with the right reasons. Nothing stays loaded in the TPM.
+  - **Offline case 12 (`TPM=1`):** eight boots of the driver in OVMF. It
+    is sealed from the first boot's event log, and the driver unseals it.
+    From the shell, after the separators, it's refused: by PolicyPCR's
+    value check, and without it by the policy. A dbx entry changes PCR 7:
+    the copy is used, and `--if-needed` reseals. A corrupted seal fails
+    cleanly. Without a TPM the copy is used. `fallback=no` deletes it, and
+    a failed unseal then leaves no key.
+  - **Known answers:** KDFa, KDFe and the policy digest are checked against
+    independent implementations (Python's hmac and hashlib,
+    `tpm2_policypcr`).
 
 ### Residual risks
 
@@ -299,6 +385,24 @@ out of git:
   Rust keeps that memory-safe, and events are validated before TrouBLE
   sees them, but a parser panic still restarts the machine (denial of
   service).
+- **The board's order with Secure Boot on:** the policy needs the driver
+  to load before the PCR 2 and PCR 7 separators that count. That holds in
+  EDK2 (PCR 2) and on this board with Secure Boot off (both). `tpm-seal.sh`
+  notes any selected PCR whose separator comes before the driver: check its
+  output once Secure Boot is on.
+- **The fallback copy:** with `fallback=yes` (the default), the key also
+  sits in the firmware's variable store, readable from a dumped flash chip
+  (see `--no-fallback`).
+- **An active attacker on the TPM bus** who can also write the ESP could
+  slip the driver a storage key of their own and learn the salt. The
+  driver checks the storage key against the name recorded at sealing, on
+  the ESP. A passive bus reader learns nothing, and an AMD fTPM has no bus.
+- **Firmware already running:** firmware code that runs between the
+  driver's load and its PCR extend could unseal. It is trusted firmware,
+  measured or not.
+- **Copies outside the driver:** the controller and the firmware's USB
+  buffers see the key in LE Enable Encryption, and RAM can be read in a
+  cold-boot attack.
 - **Building on this machine:** the driver is built where root rules. Root
   could change what gets built (the trusted bond digests, say) before you
   sign it with an off-machine key. Signing protects only what you meant to

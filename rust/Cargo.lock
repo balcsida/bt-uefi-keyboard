@@ -797,10 +797,13 @@ dependencies = [
  "embassy-futures",
  "embassy-time-driver",
  "embedded-io",
+ "hmac",
  "mtk-bt",
+ "p256",
  "sha2",
  "uefi",
  "uefi-raw",
+ "zeroize",
 ]
 
 [[package]]

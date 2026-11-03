@@ -84,12 +84,50 @@ fn tpm(eventlog_file: Option<&str>) -> Status {
     Status::SUCCESS
 }
 
+/// `-unseal-test` (offline tests only): try to unseal the driver's sealed
+/// bond from here, once with the expected PCR values (PolicyPCR checks
+/// them) and once without (the policy itself decides). Never prints the
+/// key.
+#[cfg(feature = "unseal-test")]
+fn unseal_test() -> Status {
+    use uefi_bt::seal::{self, Sealed};
+    let Ok(text) = app::read_file("bt-kb-dxe.sealed") else {
+        println!("unseal-test: no bt-kb-dxe.sealed next to btlog");
+        return Status::NOT_FOUND;
+    };
+    let Some(mut sealed) = core::str::from_utf8(&text).ok().and_then(|t| Sealed::parse(t).ok()) else {
+        println!("unseal-test: bt-kb-dxe.sealed doesn't parse");
+        return Status::VOLUME_CORRUPTED;
+    };
+    let Some(mut tcg) = tcg::open() else {
+        println!("unseal-test: no TPM");
+        return Status::NOT_FOUND;
+    };
+    let mut refused = 0;
+    for with_values in [true, false] {
+        if !with_values {
+            sealed.expected.clear();
+        }
+        let mut rng = tcg::session_rng(&mut tcg);
+        match seal::unseal(&mut *tcg, &sealed, &mut rng) {
+            Ok(_) => println!("unseal-test: UNSEALED from the shell ({}): the policy doesn't protect the bond", if with_values { "with the expected values" } else { "without" }),
+            Err(e) => {
+                refused += 1;
+                println!("unseal-test: refused {}: {}", if with_values { "with the expected values" } else { "without them" }, e.reason());
+            }
+        }
+    }
+    if refused == 2 { Status::SUCCESS } else { Status::SECURITY_VIOLATION }
+}
+
 #[entry]
 fn main() -> Status {
     let args = app::args();
     match args.iter().map(String::as_str).collect::<alloc::vec::Vec<_>>().as_slice() {
         [] => {}
         ["-eventlog", file] => return tpm(Some(file)),
+        #[cfg(feature = "unseal-test")]
+        ["-unseal-test"] => return unseal_test(),
         _ => {
             println!("usage: btlog [-eventlog FILE]");
             return Status::INVALID_PARAMETER;

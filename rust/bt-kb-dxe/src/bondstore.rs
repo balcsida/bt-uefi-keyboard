@@ -17,6 +17,11 @@
 //!   (`board-install.sh --remove`) makes it delete `BtKbBond` and the
 //!   marker, and not start. The OS can't delete a boot-services-only
 //!   variable; a UEFI shell can (`dmpstore -d BtKbBond -guid ...`).
+//! - **With a TPM** (stage 4, `crate::sealed`): an unsealed bond comes
+//!   first. `BtKbBond` stays as the fallback for boots where unsealing
+//!   fails, unless the seal says `fallback=no`: then a trusted `.bond`
+//!   file is deleted without importing it, and `BtKbBond` is deleted too,
+//!   so the key is nowhere but in the sealed object.
 
 use alloc::string::String;
 
@@ -40,6 +45,8 @@ pub enum Source {
     File,
     /// From the boot-services-only variable.
     Stored,
+    /// Unsealed from the TPM (stage 4).
+    Unsealed,
 }
 
 impl Source {
@@ -48,6 +55,7 @@ impl Source {
             Self::Imported => "imported from the ESP",
             Self::File => "from the ESP (not imported)",
             Self::Stored => "stored",
+            Self::Unsealed => "unsealed from the TPM",
         }
     }
 }
@@ -98,9 +106,21 @@ fn forget() {
     }
 }
 
-/// This boot's bond.
-pub fn load(pins: &[[u8; 32]]) -> Result<(ExportedBond, Source), String> {
+/// Delete `BtKbBond`: the seal allows no copy outside the TPM.
+fn drop_stored() {
+    match runtime::delete_variable(NAME, &VENDOR) {
+        Ok(()) => info!("the boot-services copy of the bond was deleted: the seal allows none (fallback=no)"),
+        Err(e) if e.status() == uefi::Status::NOT_FOUND => {}
+        Err(e) => error!("deleting the boot-services copy of the bond failed: {:?}", e.status()),
+    }
+}
+
+/// This boot's bond. `unsealed`: the bond unsealed from the TPM, if any;
+/// `keep_copy`: false if a seal said `fallback=no`, so there must be no
+/// copy outside the TPM, even when unsealing failed.
+pub fn load(pins: &[[u8; 32]], unsealed: Option<ExportedBond>, keep_copy: bool) -> Result<(ExportedBond, Source), String> {
     if app::read_file(MARKER).is_ok() {
+        drop(unsealed);
         forget();
         return Err(alloc::format!("the bond was forgotten as asked ({MARKER}); not starting"));
     }
@@ -109,7 +129,37 @@ pub fn load(pins: &[[u8; 32]]) -> Result<(ExportedBond, Source), String> {
             "this build trusts no bond: build it with BT_KB_BOND_DIGESTS (scripts/build-rust.sh does that from qemu/keys/*.bond)",
         ));
     }
-    // A trusted file on the ESP: imported, then deleted.
+    let imported = import_files(pins, keep_copy);
+    if !keep_copy {
+        drop_stored();
+    }
+    if let Some(bond) = unsealed {
+        drop(imported);
+        return Ok((bond, Source::Unsealed));
+    }
+    if !keep_copy {
+        return Err(String::from(
+            "the sealed bond couldn't be used, and the seal allows no other copy (fallback=no): reseal from the OS (sudo scripts/tpm-seal.sh)",
+        ));
+    }
+    if let Some(found) = imported {
+        return Ok(found);
+    }
+    match read_stored() {
+        Some(bond) if trusted(&bond, pins) => Ok((bond, Source::Stored)),
+        Some(mut bond) => {
+            bond.wipe();
+            Err(String::from(
+                "the stored bond isn't one this driver was built for (re-paired? install the new bond: sudo scripts/board-install.sh)",
+            ))
+        }
+        None => Err(String::from("no bond: no trusted *.bond file next to the driver, and none stored (sudo scripts/board-install.sh)")),
+    }
+}
+
+/// A trusted `*.bond` file next to the driver: imported into `BtKbBond`
+/// and deleted (`store`), or with `store` false only deleted.
+fn import_files(pins: &[[u8; 32]], store_it: bool) -> Option<(ExportedBond, Source)> {
     for name in app::files_with_suffix(".bond").unwrap_or_default() {
         let mut data = match app::read_file(&name) {
             Ok(data) => data,
@@ -132,24 +182,23 @@ pub fn load(pins: &[[u8; 32]]) -> Result<(ExportedBond, Source), String> {
             bond.wipe();
             continue;
         }
+        if !store_it {
+            bond.wipe();
+            match app::delete_file(&name) {
+                Ok(()) => info!("{name} deleted without importing it: the bond is sealed to the TPM, and the seal allows no copy"),
+                Err(e) => error!("deleting {name} failed ({e}): the link key is still on the ESP"),
+            }
+            continue;
+        }
         if !store(&bond) {
             error!("the bond couldn't be stored in NVRAM: using {name}, which stays on the ESP");
-            return Ok((bond, Source::File));
+            return Some((bond, Source::File));
         }
         match app::delete_file(&name) {
             Ok(()) => info!("bond imported into a variable the OS can't read; {name} deleted from the ESP"),
             Err(e) => error!("bond imported, but deleting {name} failed ({e}): the link key is still on the ESP"),
         }
-        return Ok((bond, Source::Imported));
+        return Some((bond, Source::Imported));
     }
-    match read_stored() {
-        Some(bond) if trusted(&bond, pins) => Ok((bond, Source::Stored)),
-        Some(mut bond) => {
-            bond.wipe();
-            Err(String::from(
-                "the stored bond isn't one this driver was built for (re-paired? install the new bond: sudo scripts/board-install.sh)",
-            ))
-        }
-        None => Err(String::from("no bond: no trusted *.bond file next to the driver, and none stored (sudo scripts/board-install.sh)")),
-    }
+    None
 }

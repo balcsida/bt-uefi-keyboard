@@ -43,6 +43,7 @@ extern crate alloc;
 mod bondstore;
 mod cache;
 mod cell;
+mod sealed;
 mod dlog;
 mod record;
 mod safety;
@@ -254,19 +255,31 @@ fn load() -> Status {
         Some(text) => info!("previous boot: {text}"),
         None => info!("previous boot: no record"),
     }
-    match safety::count_start() {
+    let start = safety::count_start();
+    match start {
         Ok(n) => info!("start {n} of at most {} before an OS has to boot", safety::LIMIT),
-        Err(n) => {
-            error!("not starting: {n} starts in a row never reached an OS; delete the BtKbBoots variable to re-enable");
-            return Status::ABORTED;
-        }
+        Err(n) => error!("not starting: {n} starts in a row never reached an OS; delete the BtKbBoots variable to re-enable"),
     }
     let image = boot::image_handle();
     let tpm = tpm::log_state();
+    // Stage 4: unseal the bond, then extend the spare PCR. On every start,
+    // even one the boot-loop guard stops, so nothing later can unseal.
+    let sealed = sealed::run(start.is_ok(), TRUSTED_BONDS);
     record::update(|r| {
         r.tpm_separators = Some(tpm.map(|t| t.separators));
+        if let sealed::Outcome::Failed { reason, .. } = sealed {
+            r.unseal_failed = Some(reason);
+        }
         false
     });
+    if start.is_err() {
+        return Status::ABORTED;
+    }
+    let (unsealed, keep_copy) = match sealed {
+        sealed::Outcome::Unsealed { bond, fallback } => (Some(bond), fallback),
+        sealed::Outcome::Failed { fallback, .. } => (None, fallback),
+        sealed::Outcome::NoTpm | sealed::Outcome::NotSealed => (None, true),
+    };
 
     if let Ok(text) = app::read_file(SELFTEST_FILE) {
         return selftest::start(text);
@@ -305,7 +318,7 @@ fn load() -> Status {
             return Status::VOLUME_CORRUPTED;
         }
     };
-    let bond = match bondstore::load(TRUSTED_BONDS) {
+    let bond = match bondstore::load(TRUSTED_BONDS, unsealed, keep_copy) {
         Ok((bond, source)) => {
             record::update(|r| {
                 r.bond = Some(source.text());
@@ -387,7 +400,10 @@ fn bond_information(bond: &ExportedBond) -> BondInformation {
     // No IRK: the keyboard advertises with its identity address.
     let identity = Identity { addr: Address::new(kind, BdAddr::new(bond.peer)), irk: None };
     let level = if bond.authenticated() { SecurityLevel::EncryptedAuthenticated } else { SecurityLevel::Encrypted };
-    let mut info = BondInformation::new(identity, LongTermKey::from_le_bytes(bond.ltk), level, true);
+    // The stand-in, not the key: the guard puts the key into LE Enable
+    // Encryption (uefi_bt::tap::STAND_IN_LTK), and TrouBLE's memory, which
+    // the OS gets as it is, never holds it.
+    let mut info = BondInformation::new(identity, LongTermKey::from_le_bytes(uefi_bt::tap::STAND_IN_LTK), level, true);
     info.ediv = bond.ediv;
     info.rand = bond.rand_bytes();
     info.encryption_key_len = bond.enc_size;

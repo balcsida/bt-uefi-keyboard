@@ -30,6 +30,9 @@ pub struct BootRecord {
     pub failure: Option<(u64, String)>,
     /// Where the bond came from (`bondstore::Source::text`).
     pub bond: Option<&'static str>,
+    /// Why the sealed bond (stage 4) couldn't be used, if there was one.
+    /// `scripts/tpm-seal.sh --if-needed` reseals when it sees this.
+    pub unseal_failed: Option<&'static str>,
     /// Links left from before this boot, closed at bring-up.
     pub links_closed: u32,
     pub connections: u32,
@@ -85,6 +88,9 @@ impl BootRecord {
         let _ = write!(s, "loaded {} after reset {origin}", Secs(self.loaded_at_ms));
         if self.links_closed > 0 {
             let _ = write!(s, "; closed {} link(s) left from before", self.links_closed);
+        }
+        if let Some(why) = self.unseal_failed {
+            let _ = write!(s, "; unseal failed: {why}");
         }
         if let Some(source) = self.bond {
             let _ = write!(s, "; bond {source}");
@@ -256,6 +262,17 @@ mod tests {
         assert!(r.render().starts_with("loaded 9.49 s after reset by the firmware; TPM separators before the driver: 7;"));
         r.tpm_separators = Some(None);
         assert!(r.render().contains("; no TPM;"));
+    }
+
+    #[test]
+    fn unseal_failure_comes_before_the_bond_source() {
+        let r = BootRecord {
+            loaded_at_ms: 9492,
+            unseal_failed: Some("the PCRs changed since sealing"),
+            bond: Some("stored"),
+            ..BootRecord::default()
+        };
+        assert!(r.render().starts_with("loaded 9.49 s after reset by the firmware; unseal failed: the PCRs changed since sealing; bond stored;"));
     }
 
     #[test]

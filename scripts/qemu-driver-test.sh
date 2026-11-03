@@ -34,6 +34,14 @@
 #      boot-services-only variable and the file deleted; the next boot uses
 #      the stored bond; a planted file next to it is ignored; the forget
 #      marker deletes the stored bond.
+#  12. the sealed bond (stage 4, needs TPM=1), eight boots on one variable
+#      store and TPM: scripts/tpm-seal.sh seals the test bond from the first
+#      boot's event log (swtpm over TCP on the same state); the driver
+#      unseals it and extends PCR 8; `btlog -unseal-test` from the shell is
+#      refused; a dbx entry changes PCR 7, so unsealing fails and the driver
+#      uses its boot-services copy, until --if-needed reseals; a corrupted
+#      seal fails cleanly; without a TPM the copy is used; with fallback=no
+#      the copy is deleted, and a seal that then fails leaves no key.
 # The driver's log (QEMU debug console, port 0x402) is shown after each run.
 # ONLY="1 3" runs just those cases.
 #
@@ -50,10 +58,15 @@ mkdir -p "$work"
 # in rust/target/ trusts the real bonds and nothing else.
 write_test_bond "$work/test.bond"
 export PATH="$HOME/.cargo/bin:$PATH"
-(cd "$ROOT/rust" && BT_KB_FIRMWARE="$FW_BIN" BT_KB_BOND_DIGESTS="$(python3 -I "$ROOT/scripts/bond-digest.py" "$work/test.bond")" \
+test_digest="$(python3 -I "$ROOT/scripts/bond-digest.py" "$work/test.bond")"
+# btlog gets -unseal-test here (case 12), and only here.
+(cd "$ROOT/rust" && BT_KB_FIRMWARE="$FW_BIN" BT_KB_BOND_DIGESTS="$test_digest" \
   cargo build --quiet --release --target x86_64-unknown-uefi --target-dir "$ROOT/rust/target/offline-test" \
-  -p bt-kb-dxe -p bt-kb-log -p ebs-test) || { echo "building the test driver failed" >&2; exit 1; }
+  -p bt-kb-dxe -p bt-kb-log -p ebs-test --features bt-kb-log/unseal-test) || { echo "building the test driver failed" >&2; exit 1; }
 RUST_EFI_DIR="$ROOT/rust/target/offline-test/x86_64-unknown-uefi/release"
+# What scripts/tpm-seal.sh --build reads.
+echo "$test_digest" > "$RUST_EFI_DIR/bt-kb-dxe.bonds"
+echo "spare_pcr=8" > "$RUST_EFI_DIR/bt-kb-dxe.tpm"
 DRIVER="$RUST_EFI_DIR/bt-kb-dxe.efi"
 trap 'pkill -f "qemu-system-x86_64 .*${work}/" 2>/dev/null || true; for d in "$work"/*/tpm; do [ -d "$d" ] && tpm_stop "$d"; done' EXIT
 if [ -n "${SB:-}" ]; then
@@ -256,8 +269,8 @@ fresh_vars "$d/OVMF_VARS.4m.fd"
 : > "$d/driver.log"
 : > "$d/serial.log"
 # Without a TPM even under TPM=1: this boot is typed into over QMP, so it
-# can't be retried like run_qemu retries a hung TPM boot; case 8 covers
-# the TPM.
+# can't be retried like run_qemu retries a hung TPM boot; cases 8 and 12
+# cover the TPM.
 saved_tpm="${TPM:-}"
 TPM=""
 qemu_fw "$d/OVMF_VARS.4m.fd"
@@ -439,4 +452,115 @@ check "5. the forget marker deletes the stored bond and itself" "grep -q 'stored
 rm -f "$b/esp/bt-kb-dxe.forget"
 boot 6
 check "6. afterwards there is no bond" "grep -q 'no bond:' $b/6.driver.log"
+fi
+
+if want 12; then
+echo
+echo "##### 12. the sealed bond: unsealed by the driver only, resealed after a change, fallbacks"
+if [ -z "${TPM:-}" ]; then
+  echo "skipped: needs TPM=1 (swtpm and tpm2-tools)"
+else
+  t="$work/tpmseal"
+  new_esp tpmseal
+  cp "$FW_BIN" "$t/esp/"
+  cp "$(img "$RUST_EFI_DIR/bt-kb-log.efi")" "$t/esp/btlog.efi"
+  fake_bond "$t/esp"
+  fresh_vars "$t/OVMF_VARS.4m.fd"
+  add_driver_option "$t/OVMF_VARS.4m.fd" || echo "adding the Driver#### option FAILED"
+  # These boots never reach an OS: each clears the boot-loop counter.
+  printf '%s\r\n' '@echo -off' 'fs0:' "dmpstore -d BtKbBoots -guid $DIAG_GUID" 'echo "=== btlog"' \
+    'btlog -eventlog fs0:\eventlog.bin' 'echo "=== unseal-test"' 'btlog -unseal-test' 'echo "=== stored bond"' \
+    "dmpstore BtKbBond -guid $DIAG_GUID" 'echo "=== done"' 'reset -s' > "$t/esp/startup.nsh"
+  boot12 () { # boot12 N: one boot; logs kept as N.*, the event log as N.eventlog
+    KEEP_VARS=1 run_qemu tpmseal
+    cp "$t/driver.log" "$t/$1.driver.log"
+    clean_log "$t/serial.log" > "$t/$1.serial.log"
+    rm -f "$t/$1.eventlog"
+    mcopy -o -i "$t/esp.img" ::/eventlog.bin "$t/$1.eventlog" 2>/dev/null || true
+    # The driver deletes imported bond files; mirror that.
+    grep -qi 'test.bond' < <(mdir -i "$t/esp.img" -b ::/ 2>/dev/null) || rm -f "$t/esp/test.bond"
+  }
+  seal12 () { # seal12 ARGS...: scripts/tpm-seal.sh against the case's TPM
+    tpm_host_start "$t/tpm" 2391 > /dev/null || return 1
+    if [[ "${TPM2TOOLS_TCTI:-}" != swtpm:* ]]; then echo "TPM2TOOLS_TCTI isn't swtpm's: not sealing"; tpm_host_stop "$t/tpm"; return 1; fi
+    EFIVARS="$t/no-efivars" "$ROOT/scripts/tpm-seal.sh" --bond "$work/test.bond" --build "$RUST_EFI_DIR" \
+      --driver "$t/esp/bt-kb-dxe.efi" --out "$t/esp/bt-kb-dxe.sealed" "$@" 2>&1 | sed 's/^/    /'
+    tpm_host_stop "$t/tpm"
+  }
+  check () { if eval "$2"; then echo "  $1: yes"; else echo "  $1: NO"; fi; }
+  mkdir -p "$t/no-efivars"
+
+  boot12 1
+  check "1. first boot: no seal yet, the bond imported, PCR 8 extended anyway" \
+    "grep -q 'bond imported' $t/1.driver.log && grep -q 'TPM: PCR 8 extended' $t/1.driver.log"
+  python3 -I "$ROOT/scripts/eventlog.py" predict "$t/1.eventlog" 2,7 --spare 8 > "$t/1.predict" 2>/dev/null || true
+  python3 -I "$ROOT/scripts/eventlog.py" show "$t/1.eventlog" > "$t/1.events" 2>/dev/null || true
+  check "   the event log logs the driver's image with the hash scripts/eventlog.py computes for it" \
+    "grep -qx \"driver_logged=\$(python3 -I $ROOT/scripts/eventlog.py pehash $t/esp/bt-kb-dxe.efi)\" $t/1.predict"
+  check "   and PCR 8's EV_EFI_ACTION after it" "grep -q 'PCR  8 EV_EFI_ACTION' $t/1.events"
+  echo "  sealing from the first boot's event log:"
+  seal12 --eventlog "$t/1.eventlog"
+  check "   sealed" "[ -s $t/esp/bt-kb-dxe.sealed ] && grep -q '^fallback=yes' $t/esp/bt-kb-dxe.sealed"
+  cp "$t/esp/bt-kb-dxe.sealed" "$t/sealed.good"
+
+  boot12 2
+  check "2. the driver unseals the bond" "grep -q 'TPM: bond unsealed' $t/2.driver.log && grep -q '(unsealed from the TPM)' $t/2.driver.log"
+  check "   a shell app after the separators can't" \
+    "grep -q 'unseal-test: refused with the expected values' $t/2.serial.log && grep -q 'unseal-test: refused without them: the TPM policy failed' $t/2.serial.log && ! grep -q 'UNSEALED' $t/2.serial.log"
+
+  "$(fw_tool virt-fw-vars)" --input "$t/OVMF_VARS.4m.fd" --output "$t/OVMF_VARS.dbx.fd" \
+    --add-dbx-hash 11111111-2222-3333-4444-555555555555 5c1d2e3f4a5b6c7d8e9fa0b1c2d3e4f5061728394a5b6c7d8e9fa0b1c2d3e4f5 > "$t/dbx.log" 2>&1
+  mv "$t/OVMF_VARS.dbx.fd" "$t/OVMF_VARS.4m.fd"
+  boot12 3
+  check "3. after a dbx update unsealing fails (PCR 7 changed), the boot-services copy is used" \
+    "grep -q 'unsealing failed: the PCRs changed since sealing' $t/3.driver.log && grep -q 'PCRs that changed since sealing: 7' $t/3.driver.log && grep -q '(stored)' $t/3.driver.log"
+  echo "  resealing with --if-needed, twice:"
+  seal12 --eventlog "$t/3.eventlog" --if-needed
+  seal12 --eventlog "$t/3.eventlog" --if-needed
+  check "   resealed once, then up to date" "! cmp -s $t/sealed.good $t/esp/bt-kb-dxe.sealed"
+  cp "$t/esp/bt-kb-dxe.sealed" "$t/sealed.good"
+
+  boot12 4
+  check "4. the resealed bond unseals" "grep -q 'TPM: bond unsealed' $t/4.driver.log"
+
+  python3 -I - "$t/sealed.good" "$t/esp/bt-kb-dxe.sealed" <<'PY'
+import sys
+lines = open(sys.argv[1]).read().splitlines()
+for i, l in enumerate(lines):
+    if l.startswith("private="):
+        b = bytearray.fromhex(l[8:]); b[len(b) // 2] ^= 0x01; lines[i] = "private=" + b.hex()
+open(sys.argv[2], "w").write("\n".join(lines) + "\n")
+PY
+  boot12 5
+  check "5. a corrupted seal fails cleanly, the copy is used" \
+    "grep -q 'the TPM refused to load the sealed bond' $t/5.driver.log && grep -q '(stored)' $t/5.driver.log && grep -q '=== done' $t/5.serial.log"
+
+  cp "$t/sealed.good" "$t/esp/bt-kb-dxe.sealed"
+  saved_tpm="$TPM"
+  TPM=""
+  boot12 6
+  TPM="$saved_tpm"
+  check "6. without a TPM the boot-services copy is used" \
+    "grep -q 'TPM: none' $t/6.driver.log && grep -q 'no TPM 2.0: using the boot-services copy' $t/6.driver.log && grep -q '(stored)' $t/6.driver.log"
+
+  echo "  sealing again with --no-fallback:"
+  seal12 --eventlog "$t/4.eventlog" --no-fallback
+  boot12 7
+  check "7. fallback=no: unsealed, and the boot-services copy deleted" \
+    "grep -q 'TPM: bond unsealed' $t/7.driver.log && grep -q 'the boot-services copy of the bond was deleted' $t/7.driver.log && grep -q 'dmpstore: No matching variables' $t/7.serial.log"
+  python3 -I - "$t/esp/bt-kb-dxe.sealed" "$t/esp/bt-kb-dxe.sealed" <<'PY'
+import sys
+lines = open(sys.argv[1]).read().splitlines()
+for i, l in enumerate(lines):
+    if l.startswith("private="):
+        b = bytearray.fromhex(l[8:]); b[len(b) // 2] ^= 0x01; lines[i] = "private=" + b.hex()
+open(sys.argv[2], "w").write("\n".join(lines) + "\n")
+PY
+  boot12 8
+  check "8. fallback=no and a failed unseal: no key anywhere, the driver doesn't start" \
+    "grep -q 'the seal allows no other copy' $t/8.driver.log && ! grep -q 'bond for C0' $t/8.driver.log"
+  for n in 1 2 3 4 5 6 7 8; do
+    if grep -qE 'PANIC|panicked' "$t/$n.driver.log"; then echo "  boot $n: PANIC in the driver log"; fi
+  done
+fi
 fi

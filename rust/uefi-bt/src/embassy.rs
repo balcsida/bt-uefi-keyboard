@@ -273,24 +273,29 @@ impl Transport for InboxTransport<'_> {
             return Err(TransportError::Unsupported);
         }
         tx.write_hci(&mut buf[..size]).map_err(|_| TransportError::Parse)?;
-        let packet = &buf[..size];
         if let Some(guard) = self.guard {
             match P::KIND {
                 // Refused: the host stack gets an error and stops, so the
                 // driver fails closed.
-                PacketKind::Cmd if !guard.allow_command(packet) => return Err(TransportError::Refused),
+                PacketKind::Cmd if !guard.allow_command(&mut buf[..size]) => return Err(TransportError::Refused),
                 // Dropped silently: a pairing that never gets an answer
                 // times out.
-                PacketKind::AclData if !guard.allow_acl(packet) => return Ok(()),
+                PacketKind::AclData if !guard.allow_acl(&buf[..size]) => return Ok(()),
                 _ => {}
             }
         }
         let mut hci = self.hci.try_borrow_mut().map_err(|_| TransportError::Unsupported)?;
         self.inbox.writes.set(self.inbox.writes.get().wrapping_add(1));
-        match P::KIND {
+        let sent = match P::KIND {
             PacketKind::Cmd => hci.send_command(&buf[..size]).map_err(TransportError::Usb),
             PacketKind::AclData => hci.send_acl(&buf[..size]).map_err(TransportError::Usb),
             _ => Err(TransportError::Unsupported),
+        };
+        // A command may have carried the link key (the guard's LE Enable
+        // Encryption): wiped, not left on the stack.
+        if P::KIND == PacketKind::Cmd {
+            crate::bond::wipe_bytes(&mut buf[..size]);
         }
+        sent
     }
 }

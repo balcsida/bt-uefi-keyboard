@@ -48,6 +48,13 @@ pub struct ExportedBond {
     pub rand: u64,
 }
 
+/// Every way a bond goes away wipes its key, early returns included.
+impl Drop for ExportedBond {
+    fn drop(&mut self) {
+        self.wipe();
+    }
+}
+
 impl fmt::Debug for ExportedBond {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.summary())

@@ -164,6 +164,11 @@ show "$(state_of test "$sb" = 1)" "Turn Secure Boot on in firmware setup (AMI: S
   "First boot with a wired keyboard at hand. Then: scripts/board-log.sh (the driver ran)," \
   "and sbctl status (Secure Boot enabled)."
 
+if [ -f /boot/EFI/btkb/bt-kb-dxe.sealed ] 2>/dev/null; then sealed=done; elif [ -e /dev/tpmrm0 ]; then sealed=todo; else sealed=check; fi
+show "$sealed" "Optional, with a TPM: seal the bond to it (stage 4), after a boot with Secure Boot on" \
+  "(turning it on changes PCR 7): sudo $ROOT/scripts/tpm-seal.sh, then a reseal unit:" \
+  "scripts/systemd/bt-kb-reseal.service (it says how to install it)."
+
 echo
 echo "Keys off the machine (goal 1 against root):"
 echo "  sbctl keeps PK, KEK and db unencrypted in $SBCTL_KEYS, so root can sign anything,"

@@ -23,6 +23,8 @@ pub mod keymap;
 pub mod link;
 pub mod logbuf;
 pub mod pipe;
+pub mod rng;
+pub mod seal;
 pub mod tap;
 pub mod tcg;
 pub mod tpm2;

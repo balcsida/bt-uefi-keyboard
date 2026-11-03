@@ -144,7 +144,7 @@ if [ "$mode" = remove ]; then
   [ -e "$marker" ] && run rm -f "$marker"
   "$ROOT/scripts/board-diag.sh" --remove ${dry:+--dry-run}
   remove_entries
-  for f in bt-kb-dxe.efi "$FW_NAME"; do
+  for f in bt-kb-dxe.efi btlog.efi bt-kb-dxe.sealed "$FW_NAME"; do
     [ -e "$DEST/$f" ] && run rm -f "$DEST/$f"
   done
   for f in "$DEST"/*.bond; do
@@ -290,8 +290,26 @@ fi
 for f in "$DEST"/*.bond; do
   [ -e "$f" ] && run rm -f "$f"
 done
-run cp "${bonds[0]}" "$DEST/"
-echo "The driver imports the bond at the next boot and deletes ${bonds[0]##*/} from the ESP."
+# Sealed to the TPM (scripts/tpm-seal.sh) without a fallback copy: the
+# bond file never goes on the ESP; the seal is renewed for the new driver.
+sealed_only=""
+grep -qx 'fallback=no' "$DEST/bt-kb-dxe.sealed" 2>/dev/null && sealed_only=1
+if [ -n "$sealed_only" ]; then
+  echo "The bond is sealed to the TPM without a fallback copy (fallback=no): not copying ${bonds[0]##*/}."
+else
+  run cp "${bonds[0]}" "$DEST/"
+  echo "The driver imports the bond at the next boot and deletes ${bonds[0]##*/} from the ESP."
+fi
+if [ -f "$DEST/bt-kb-dxe.sealed" ]; then
+  # The new driver measures differently: predict its PCR 2 now, so the
+  # next boot unseals (the event log of this boot shows where it loads).
+  echo "Renewing the TPM seal for the new driver:"
+  if [ -n "$dry" ]; then
+    run "$ROOT/scripts/tpm-seal.sh" --if-needed ${sealed_only:+--no-fallback} --driver "$DEST/bt-kb-dxe.efi"
+  elif ! "$ROOT/scripts/tpm-seal.sh" --if-needed ${sealed_only:+--no-fallback} --driver "$DEST/bt-kb-dxe.efi"; then
+    echo "WARNING: resealing failed; the next boot falls back to the boot-services copy, if any. Seal after it: sudo scripts/tpm-seal.sh"
+  fi
+fi
 existing="$(our_entries | head -1)"
 if [ -n "$existing" ]; then
   # Possibly the full-path entry from scripts/board-diag.sh: the files
@@ -314,4 +332,5 @@ if [ -z "$dry" ]; then
   efibootmgr -r
   echo
   echo "Installed. After the next boot into Linux: scripts/board-log.sh"
+  [ -f "$DEST/bt-kb-dxe.sealed" ] || echo "To seal the bond to the TPM after that boot (stage 4): sudo scripts/tpm-seal.sh"
 fi

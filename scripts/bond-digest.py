@@ -3,6 +3,7 @@
 hardening; README, Security).
 
     python3 -I scripts/bond-digest.py FILE.bond...
+    python3 -I scripts/bond-digest.py --record FILE.bond | tpm2_create ... -i -
 
 Prints one SHA-256 per bond file, the way the driver computes it
 (ExportedBond::digest in rust/uefi-bt/src/bond.rs; the two must agree byte
@@ -15,6 +16,9 @@ for byte): SHA-256 of "bt-kb-dxe bond v1\\0" and the bond's 42-byte record:
 
 A digest reveals nothing about the key. scripts/build-rust.sh passes the
 digests of qemu/keys/*.bond to the build in BT_KB_BOND_DIGESTS.
+
+--record writes the record itself, key included, to standard output for a
+pipe (scripts/tpm-seal.sh seals it); never to a terminal.
 """
 
 import hashlib
@@ -57,6 +61,16 @@ def parse(text):
 
 
 def main(paths):
+    if paths[:1] == ["--record"]:
+        if len(paths) != 2:
+            print(__doc__, file=sys.stderr)
+            return 2
+        if sys.stdout.isatty():
+            print("refusing to write a link key to a terminal: pipe it", file=sys.stderr)
+            return 1
+        with open(paths[1], encoding="ascii") as f:
+            sys.stdout.buffer.write(record(parse(f.read())))
+        return 0
     if not paths:
         print(__doc__, file=sys.stderr)
         return 2

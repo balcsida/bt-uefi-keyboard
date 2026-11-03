@@ -1,0 +1,27 @@
+# Reseal bt-kb-dxe's bond to the TPM after something moved the PCRs it's
+# sealed to (stage 4 of the security hardening; README, Security): a dbx or
+# Secure Boot key update, a firmware update, a new option ROM. At such a
+# boot the driver falls back to its boot-services copy (or, with
+# fallback=no, has no key) and records why; this reseals from that boot's
+# event log, so the next boot unseals again. A no-op otherwise.
+#
+# Install, with this repository's path in place of @REPO@ (the bond is read
+# from @REPO@/qemu/keys/, on the encrypted root file system):
+#   sudo sed 's|@REPO@|/path/to/bt-uefi-keyboard|' scripts/systemd/bt-kb-reseal.service \
+#     > /etc/systemd/system/bt-kb-reseal.service
+#   sudo systemctl daemon-reload && sudo systemctl enable bt-kb-reseal.service
+
+[Unit]
+Description=Reseal the Bluetooth keyboard bond for bt-kb-dxe to the TPM
+Documentation=file://@REPO@/README.md
+ConditionPathExists=/boot/EFI/btkb/bt-kb-dxe.sealed
+RequiresMountsFor=/boot @REPO@
+After=tpm2.target systemd-tpm2-setup.service
+Wants=tpm2.target
+
+[Service]
+Type=oneshot
+ExecStart=@REPO@/scripts/tpm-seal.sh --if-needed
+
+[Install]
+WantedBy=multi-user.target

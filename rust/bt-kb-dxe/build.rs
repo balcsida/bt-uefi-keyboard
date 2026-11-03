@@ -12,6 +12,12 @@
 // trusts. Anyone who can write the ESP can drop a bond file there, but
 // only a driver signed with the db key can trust it. Without
 // BT_KB_BOND_DIGESTS the build trusts no bond.
+//
+// And so is the spare PCR (stage 4): BT_KB_SPARE_PCR (8 to 15, default 8;
+// "none" for none) is the PCR the driver extends on every boot right after
+// it tried to unseal its bond, so nothing that runs later can unseal it. A
+// build setting, not a file on the ESP: whoever can write the ESP must not
+// be able to make the driver skip it.
 use std::{env, fs, path::Path};
 
 use sha2::{Digest, Sha256};
@@ -20,6 +26,15 @@ fn main() {
     println!("cargo:rustc-link-arg-bins=/subsystem:efi_boot_service_driver");
     println!("cargo:rerun-if-env-changed=BT_KB_FIRMWARE");
     println!("cargo:rerun-if-env-changed=BT_KB_BOND_DIGESTS");
+    println!("cargo:rerun-if-env-changed=BT_KB_SPARE_PCR");
+    let spare = match env::var("BT_KB_SPARE_PCR").as_deref().map(str::trim) {
+        Err(_) | Ok("") => Some(8u32),
+        Ok("none") => None,
+        Ok(n) => match n.parse::<u32>() {
+            Ok(n @ 8..=15) => Some(n),
+            _ => panic!("BT_KB_SPARE_PCR: {n:?} isn't a PCR from 8 to 15, or none"),
+        },
+    };
     let bonds: Vec<[u8; 32]> = env::var("BT_KB_BOND_DIGESTS")
         .unwrap_or_default()
         .split(|c: char| c == ',' || c.is_whitespace())
@@ -50,7 +65,9 @@ fn main() {
              /// (`BT_KB_FIRMWARE` at build time; `None`: none).\n\
              pub const FIRMWARE_SHA256: Option<[u8; 32]> = {pin};\n\
              /// Digests of the only bonds this build trusts (`BT_KB_BOND_DIGESTS`).\n\
-             pub const TRUSTED_BONDS: &[[u8; 32]] = &{bonds:?};\n"
+             pub const TRUSTED_BONDS: &[[u8; 32]] = &{bonds:?};\n\
+             /// The PCR the driver extends after trying to unseal (`BT_KB_SPARE_PCR`).\n\
+             pub const SPARE_PCR: Option<u32> = {spare:?};\n"
         ),
     )
     .expect("writing pins.rs");
