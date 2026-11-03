@@ -2,8 +2,8 @@
 # Milestone 5: install bt-kb-dxe on this PC's ESP as a UEFI driver that the
 # board's firmware loads at every boot (a Driver#### entry), or remove it.
 #   sudo scripts/board-install.sh             install, or update after a rebuild
-#   sudo scripts/board-install.sh --remove    remove the entry, the files and the driver's variables
-#                                             (and the diagnostics of scripts/board-diag.sh)
+#   sudo scripts/board-install.sh --remove    remove the driver, in two steps (see below)
+#   sudo scripts/board-install.sh --remove --force   all at once
 #   scripts/board-install.sh --dry-run [...]  print what would be done, change nothing
 #
 # Files go to \EFI\btkb\ on the ESP (mounted at /boot):
@@ -11,7 +11,18 @@
 #   - the MT7922 firmware image, from linux-firmware: the driver only reads
 #     it to ask the chip whether its firmware is loaded, and never uploads;
 #   - the keyboard's bond from qemu/keys/ (sudo scripts/export-bond.sh). It
-#     holds the keyboard's link key; /boot is readable by root only.
+#     holds the keyboard's link key, so it only stays until the next boot:
+#     the driver copies it into a variable the OS can't read (BtKbBond, no
+#     RUNTIME_ACCESS) and deletes the file. The driver build must trust the
+#     bond (scripts/build-rust.sh pins the digests of qemu/keys/*.bond).
+#
+# Removing takes two steps, since the OS can't delete a variable without
+# RUNTIME_ACCESS: the first --remove deletes any bond file and leaves
+# bt-kb-dxe.forget, which makes the driver delete its stored bond at the
+# next boot; the second, after that boot, removes the entry, the files and
+# the other variables (and the diagnostics of scripts/board-diag.sh).
+# --force skips the first step; the stored bond then stays in NVRAM until a
+# UEFI shell deletes it: dmpstore -d BtKbBond -guid 5223227b-ac96-454e-9bca-f15199748a3c
 #
 # Secure Boot (stage 2 of the security hardening; README, Security). The
 # firmware verifies Driver#### images against db itself, so the driver and
@@ -50,11 +61,13 @@ SBCTL_KEYS="${SBCTL_KEYS:-/var/lib/sbctl/keys}"
 
 dry=""
 mode=install
+force=""
 for arg in "$@"; do
   case "$arg" in
     --dry-run) dry=1 ;;
     --remove) mode=remove ;;
-    *) echo "usage: $0 [--dry-run] [--remove]" >&2; exit 2 ;;
+    --force) force=1 ;;
+    *) echo "usage: $0 [--dry-run] [--remove [--force]]" >&2; exit 2 ;;
   esac
 done
 
@@ -104,6 +117,31 @@ delete_variable () {
 }
 
 if [ "$mode" = remove ]; then
+  marker="$DEST/bt-kb-dxe.forget"
+  record="$(tail -c +5 "$EFIVARS/BtKbLastBoot-$VENDOR" 2>/dev/null | tr -cd '[:print:]' || true)"
+  installed=""
+  if [ -f "$DEST/bt-kb-dxe.efi" ]; then
+    installed=1
+  elif [ -n "$dry" ] && ! ls /boot/EFI >/dev/null 2>&1; then
+    echo "(dry run without sudo: the ESP isn't readable; assuming the driver is installed)"
+    installed=1
+  fi
+  if [ -z "$force" ] && [ -n "$installed" ] && [[ "$record" != *"bond was forgotten"* ]]; then
+    for f in "$DEST"/*.bond; do
+      [ -e "$f" ] && { echo "Deleting $f (it holds the link key)"; run rm -f "$f"; }
+    done
+    if [ -e "$marker" ]; then
+      echo "Waiting for the driver: $marker is still there, so it hasn't run since the first --remove."
+      echo "Reboot once (with Fast Boot off), then run --remove again; or --remove --force (see the top of this script)."
+      exit 1
+    fi
+    echo "Step 1 of 2: leaving $marker, which makes the driver delete its stored bond at the next boot."
+    if [ -n "$dry" ]; then echo "  would run: touch $marker"; else : > "$marker"; fi
+    echo "Reboot once, then run: sudo scripts/board-install.sh --remove"
+    exit 0
+  fi
+  [ -n "$force" ] && echo "Removing at once (--force): a bond the driver stored stays in NVRAM until a UEFI shell deletes it."
+  [ -e "$marker" ] && run rm -f "$marker"
   "$ROOT/scripts/board-diag.sh" --remove ${dry:+--dry-run}
   remove_entries
   for f in bt-kb-dxe.efi "$FW_NAME"; do
@@ -190,6 +228,11 @@ if [ ! -f "${bonds[0]}" ] || [ "${#bonds[@]}" -ne 1 ]; then
   echo "Need exactly one exported bond in qemu/keys/ (sudo scripts/export-bond.sh)." >&2
   exit 1
 fi
+if ! grep -qx "$(python3 -I "$ROOT/scripts/bond-digest.py" "${bonds[0]}")" "$(dirname "$DRIVER")/bt-kb-dxe.bonds" 2>/dev/null; then
+  echo "The driver build doesn't trust ${bonds[0]##*/} (exported after the build?)." >&2
+  echo "Rebuild first, as yourself: scripts/build-rust.sh" >&2
+  exit 1
+fi
 if [ ! -f "$FW_SRC" ]; then
   echo "Firmware image $FW_SRC not found (linux-firmware-mediatek)." >&2
   exit 1
@@ -248,6 +291,7 @@ for f in "$DEST"/*.bond; do
   [ -e "$f" ] && run rm -f "$f"
 done
 run cp "${bonds[0]}" "$DEST/"
+echo "The driver imports the bond at the next boot and deletes ${bonds[0]##*/} from the ESP."
 existing="$(our_entries | head -1)"
 if [ -n "$existing" ]; then
   # Possibly the full-path entry from scripts/board-diag.sh: the files

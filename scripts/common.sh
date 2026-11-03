@@ -345,3 +345,12 @@ tpm_host_stop () {
   tpm_stop "$1"
   unset TPM2TOOLS_TCTI
 }
+
+# A throwaway bond for the offline tests (a public, made-up link key; the
+# placeholder addresses). Only the offline test build trusts it: production
+# builds (scripts/build-rust.sh) pin the bonds in qemu/keys/ only, since a
+# build that trusted a public key would let anyone in radio range type.
+write_test_bond () {
+  printf 'peer=C0:00:00:00:00:01\npeer_type=static\nadapter=02:00:00:00:00:02\nltk=7E57B0ED7E57B0ED7E57B0ED7E57B0ED\nltk_type=1\nenc_size=16\nediv=4660\nrand=1311768467463790320\nirk=\n' > "$1"
+}
+

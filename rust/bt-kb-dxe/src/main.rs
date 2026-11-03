@@ -27,7 +27,10 @@
 //! - **Logging:** never to the console; see `dlog`. Boot-loop protection:
 //!   see `safety`.
 //! - **Files** next to the driver: the MT7922 firmware image (for the
-//!   section check), a `*.bond` file from `scripts/export-bond.sh`, and,
+//!   section check, pinned by SHA-256 at build time), a `*.bond` file from
+//!   `scripts/export-bond.sh` until the driver has imported it into a
+//!   variable the OS can't read (`bondstore`; only bonds the build pins
+//!   count), and,
 //!   for the offline self-test, `bt-kb-dxe.selftest`. For test sessions,
 //!   `bt-kb-dxe.timelimit` (seconds): when it runs out, the driver hands
 //!   the controller back and powers the machine off.
@@ -37,6 +40,7 @@
 
 extern crate alloc;
 
+mod bondstore;
 mod cache;
 mod cell;
 mod dlog;
@@ -68,11 +72,10 @@ use log::{error, info, warn};
 use mtk_bt::{AclKind, FirmwareImage, Mtk};
 use trouble_host::prelude::{AddrKind, Address, BdAddr, BondInformation, HostResources, Identity, LongTermKey, SecurityLevel, Stack};
 use uefi::boot::{self, EventType, OpenProtocolAttributes, OpenProtocolParams, ScopedProtocol, SearchType, TimerTrigger, Tpl};
-use uefi::fs::{FileSystem, PathBuf};
 use uefi::prelude::*;
 use uefi::proto::device_path::DevicePath;
 use uefi::proto::usb::io::UsbIo;
-use uefi::{CString16, Event, Handle, Identify};
+use uefi::{Event, Handle, Identify};
 use uefi_bt::bond::{addr_text, ExportedBond};
 use uefi_bt::embassy::{Inbox, InboxTransport};
 use uefi_bt::keymap::{Event as KeyEvent, Key, KeyboardState};
@@ -89,8 +92,8 @@ use session::{Ctrl, Pool, Shared};
 use textin::Child;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-// FIRMWARE_SHA256, from build.rs.
-include!(concat!(env!("OUT_DIR"), "/firmware_pin.rs"));
+// FIRMWARE_SHA256 and TRUSTED_BONDS, from build.rs.
+include!(concat!(env!("OUT_DIR"), "/pins.rs"));
 const FW_FILE: &str = "BT_RAM_CODE_MT7922_1_1_hdr.bin";
 const SELFTEST_FILE: &str = "bt-kb-dxe.selftest";
 const TIME_LIMIT_FILE: &str = "bt-kb-dxe.timelimit";
@@ -302,14 +305,21 @@ fn load() -> Status {
             return Status::VOLUME_CORRUPTED;
         }
     };
-    let bond = match load_bond() {
-        Ok(bond) => bond,
+    let bond = match bondstore::load(TRUSTED_BONDS) {
+        Ok((bond, source)) => {
+            record::update(|r| {
+                r.bond = Some(source.text());
+                false
+            });
+            info!("{} ({})", bond.summary(), source.text());
+            bond
+        }
         Err(e) => {
             error!("{e}");
+            record::failed(clock::now_ms(), &e);
             return Status::NOT_FOUND;
         }
     };
-    info!("{}", bond.summary());
     let time_limit_ms = app::read_file(TIME_LIMIT_FILE)
         .ok()
         .and_then(|data| core::str::from_utf8(&data).ok()?.trim().parse::<u64>().ok())
@@ -370,28 +380,6 @@ unsafe extern "efiapi" fn usb_arrived(_event: Event, _context: Option<NonNull<c_
         let result = boot::connect_controller(handle, &[Some(boot::image_handle()), None], None, false);
         info!("new USB interface {}: connect {:?}", path_text(handle), result.map_err(|e| e.status()));
     }
-}
-
-/// The first `*.bond` file next to the driver.
-fn load_bond() -> Result<ExportedBond, String> {
-    let dir = app::image_dir();
-    let name = {
-        // uefi-rs opens the file system exclusively: close it before
-        // `read_file` opens it again.
-        let sfs = boot::get_image_file_system(boot::image_handle()).map_err(|e| alloc::format!("no file system: {e:?}"))?;
-        let mut fs = FileSystem::new(sfs);
-        // Not `dir` itself: its trailing separator fails uefi-rs's path check.
-        let path = CString16::try_from(app::listing_path(&dir)).map_err(|_| String::from("bad directory name"))?;
-        let entries = fs.read_dir(PathBuf::from(path)).map_err(|e| alloc::format!("listing {dir} failed: {e}"))?;
-        entries
-            .filter_map(Result::ok)
-            .map(|info| String::from(info.file_name()))
-            .find(|name| name.to_ascii_lowercase().ends_with(".bond"))
-            .ok_or_else(|| alloc::format!("no *.bond file in {dir} (see scripts/export-bond.sh)"))?
-    };
-    let data = app::read_file(&name)?;
-    let text = core::str::from_utf8(&data).map_err(|_| alloc::format!("{name} is not text"))?;
-    ExportedBond::parse(text).map_err(|e| alloc::format!("{name}: {e}"))
 }
 
 fn bond_information(bond: &ExportedBond) -> BondInformation {
@@ -1271,6 +1259,7 @@ unsafe extern "efiapi" fn before_exit_boot_services(_event: Event, _context: Opt
     });
     unregister_reset_notify();
     safety::clear();
+    wipe_secrets();
     let now = clock::now_ms();
     record::update(|r| {
         r.os_started_ms = Some(now);
@@ -1278,6 +1267,17 @@ unsafe extern "efiapi" fn before_exit_boot_services(_event: Event, _context: Opt
     });
     record::write_now(now);
     dlog::flush(true);
+}
+
+/// Overwrite the driver's copy of the link key: the OS gets boot services
+/// memory as it is. (The guard wipes its own copy at the hand-off.)
+fn wipe_secrets() {
+    let cfg = CONFIG.load(Ordering::Acquire);
+    if !cfg.is_null() {
+        // SAFETY: the leaked Config; nothing holds a reference into its
+        // bond while this runs (the tick is at the same TPL, so not now).
+        unsafe { (*core::ptr::addr_of_mut!((*cfg).bond)).wipe() };
+    }
 }
 
 unsafe extern "efiapi" fn exit_boot_services(_event: Event, _context: Option<NonNull<c_void>>) {

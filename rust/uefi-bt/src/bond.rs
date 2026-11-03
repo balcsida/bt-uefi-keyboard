@@ -14,9 +14,23 @@
 //! ```
 //!
 //! The key is secret: nothing here prints it, and `Debug` leaves it out.
+//!
+//! [`ExportedBond::record`] is the bond in a fixed binary layout: what the
+//! driver keeps in its boot-services-only variable, and what
+//! [`ExportedBond::digest`] hashes. A driver build trusts only the bonds
+//! whose digests it was built with (`scripts/bond-digest.py` computes them
+//! on the OS side; both must agree byte for byte).
 
 use alloc::string::String;
 use core::fmt;
+
+/// Record layout version (first byte of [`ExportedBond::record`]).
+pub const RECORD_VERSION: u8 = 1;
+/// Version, peer (6), peer is random (1), adapter (6), LTK (16), key type,
+/// key size, EDIV (2), Rand (8).
+pub const RECORD_LEN: usize = 42;
+/// Hashed before the record, so a bond digest can't stand for anything else.
+const DIGEST_DOMAIN: &[u8] = b"bt-kb-dxe bond v1\0";
 
 pub struct ExportedBond {
     /// Keyboard address, least significant byte first (HCI order).
@@ -118,6 +132,65 @@ impl ExportedBond {
         self.rand.to_le_bytes()
     }
 
+    /// The bond in its fixed binary layout. Holds the key: wipe it after use.
+    pub fn record(&self) -> [u8; RECORD_LEN] {
+        let mut r = [0u8; RECORD_LEN];
+        r[0] = RECORD_VERSION;
+        r[1..7].copy_from_slice(&self.peer);
+        r[7] = u8::from(self.peer_is_random);
+        r[8..14].copy_from_slice(&self.adapter);
+        r[14..30].copy_from_slice(&self.ltk);
+        r[30] = self.ltk_type;
+        r[31] = self.enc_size;
+        r[32..34].copy_from_slice(&self.ediv.to_le_bytes());
+        r[34..42].copy_from_slice(&self.rand.to_le_bytes());
+        r
+    }
+
+    /// A record read back; only this version and a sane key are accepted.
+    pub fn from_record(r: &[u8]) -> Result<Self, BondError> {
+        if r.len() != RECORD_LEN || r[0] != RECORD_VERSION || r[7] > 1 || r[30] > 4 || !(7..=16).contains(&r[31]) {
+            return Err(BondError::Invalid("record"));
+        }
+        let mut bond = Self {
+            peer: [0; 6],
+            peer_is_random: r[7] == 1,
+            adapter: [0; 6],
+            ltk: [0; 16],
+            ltk_type: r[30],
+            enc_size: r[31],
+            ediv: u16::from_le_bytes([r[32], r[33]]),
+            rand: u64::from_le_bytes(r[34..42].try_into().map_err(|_| BondError::Invalid("record"))?),
+        };
+        bond.peer.copy_from_slice(&r[1..7]);
+        bond.adapter.copy_from_slice(&r[8..14]);
+        bond.ltk.copy_from_slice(&r[14..30]);
+        Ok(bond)
+    }
+
+    /// What a driver build pins for this bond: SHA-256 of a domain tag and
+    /// the record. Reveals nothing about the key.
+    pub fn digest(&self) -> [u8; 32] {
+        use sha2::Digest;
+        let mut record = self.record();
+        let mut h = sha2::Sha256::new();
+        h.update(DIGEST_DOMAIN);
+        h.update(record);
+        wipe_bytes(&mut record);
+        h.finalize().into()
+    }
+
+    /// Overwrite the key material.
+    pub fn wipe(&mut self) {
+        wipe_bytes(&mut self.ltk);
+        // SAFETY: valid, aligned pointers to fields we own.
+        unsafe {
+            core::ptr::write_volatile(&mut self.ediv, 0);
+            core::ptr::write_volatile(&mut self.rand, 0);
+        }
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Everything except the key.
     pub fn summary(&self) -> String {
         alloc::format!(
@@ -133,11 +206,24 @@ impl ExportedBond {
     }
 }
 
+/// Overwrite bytes that held key material, so the compiler can't drop it.
+pub fn wipe_bytes(bytes: &mut [u8]) {
+    for b in bytes.iter_mut() {
+        // SAFETY: a valid pointer to a byte we own.
+        unsafe { core::ptr::write_volatile(b, 0) };
+    }
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
 
     use super::*;
+
+    /// SHA-256 of the domain tag and SAMPLE's record, as computed by
+    /// `scripts/bond-digest.py` (the two must agree).
+    const DIGEST_OF_SAMPLE: &str = "e668fd2ee2a48162567b05a3c0f4c40347e473c0fcfa34dacc6238701596cffd";
 
     const SAMPLE: &str = "# BlueZ bond for C0:00:00:00:00:01, exported for a test
 peer=C0:00:00:00:00:01
@@ -174,6 +260,49 @@ irk=00112233445566778899AABBCCDDEEFF
             assert!(text.contains("C0:00:00:00:00:01"));
             assert!(text.contains("legacy authenticated"));
         }
+    }
+
+    #[test]
+    fn record_round_trip_and_digest() {
+        let bond = ExportedBond::parse(SAMPLE).unwrap();
+        let record = bond.record();
+        let back = ExportedBond::from_record(&record).unwrap();
+        assert_eq!(back.record(), record);
+        // The value scripts/bond-digest.py computes for SAMPLE.
+        let hex: std::string::String = bond.digest().iter().map(|b| std::format!("{b:02x}")).collect();
+        assert_eq!(hex, DIGEST_OF_SAMPLE);
+        // Every field counts.
+        let mut other = ExportedBond::parse(SAMPLE).unwrap();
+        other.ltk[15] ^= 1;
+        assert_ne!(other.digest(), bond.digest());
+        let mut other = ExportedBond::parse(SAMPLE).unwrap();
+        other.peer_is_random = false;
+        assert_ne!(other.digest(), bond.digest());
+        let mut other = ExportedBond::parse(SAMPLE).unwrap();
+        other.rand += 1;
+        assert_ne!(other.digest(), bond.digest());
+    }
+
+    #[test]
+    fn bad_records_are_rejected() {
+        let record = ExportedBond::parse(SAMPLE).unwrap().record();
+        assert!(ExportedBond::from_record(&record[..41]).is_err());
+        let mut r = record;
+        r[0] = 2;
+        assert!(ExportedBond::from_record(&r).is_err(), "other version");
+        let mut r = record;
+        r[31] = 0;
+        assert!(ExportedBond::from_record(&r).is_err(), "key size 0");
+        let mut r = record;
+        r[7] = 2;
+        assert!(ExportedBond::from_record(&r).is_err(), "address type");
+    }
+
+    #[test]
+    fn wipe_clears_the_key() {
+        let mut bond = ExportedBond::parse(SAMPLE).unwrap();
+        bond.wipe();
+        assert_eq!((bond.ltk, bond.ediv, bond.rand), ([0; 16], 0, 0));
     }
 
     #[test]

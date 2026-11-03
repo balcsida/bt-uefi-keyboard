@@ -53,21 +53,7 @@ pub fn listing_path(dir: &str) -> &str {
 /// case), in name order: `first_file_with_suffix(".bond")` finds the bond
 /// that scripts/export-bond.sh exported, whatever the keyboard's address.
 pub fn first_file_with_suffix(suffix: &str) -> Result<String, String> {
-    let dir = image_dir();
-    let sfs = boot::get_image_file_system(boot::image_handle()).map_err(|e| alloc::format!("no file system: {e:?}"))?;
-    // Dropped before returning: uefi-rs opens the volume exclusively, and
-    // `read_file` opens it again.
-    let mut fs = FileSystem::new(sfs);
-    let path = CString16::try_from(listing_path(&dir)).map_err(|_| String::from("bad directory name"))?;
-    let entries = fs.read_dir(PathBuf::from(path)).map_err(|e| alloc::format!("listing {dir} failed: {e}"))?;
-    let wanted = suffix.to_ascii_lowercase();
-    let mut names: Vec<String> = entries
-        .filter_map(Result::ok)
-        .map(|info| String::from(info.file_name()))
-        .filter(|name| name.to_ascii_lowercase().ends_with(&wanted))
-        .collect();
-    names.sort();
-    names.into_iter().next().ok_or_else(|| alloc::format!("no *{suffix} file in {dir}"))
+    files_with_suffix(suffix)?.into_iter().next().ok_or_else(|| alloc::format!("no *{suffix} file in {}", image_dir()))
 }
 
 /// Read a file from this image's volume; relative paths are relative to the image.
@@ -93,6 +79,40 @@ pub fn write_file(name: &str, data: &[u8]) -> Result<(), String> {
         uefi::fs::Error::Io(io) => alloc::format!("{full}: {:?}", io.uefi_error.status()),
         other => alloc::format!("{full}: {other}"),
     })
+}
+
+/// Delete a file on this image's volume; relative paths are relative to
+/// the image.
+pub fn delete_file(name: &str) -> Result<(), String> {
+    let full = if name.starts_with('\\') { String::from(name) } else { image_dir() + name };
+    let sfs = boot::get_image_file_system(boot::image_handle()).map_err(|e| alloc::format!("{e:?}"))?;
+    let mut fs = FileSystem::new(sfs);
+    let path = CString16::try_from(full.as_str()).map_err(|_| String::from("bad path"))?;
+    fs.remove_file(PathBuf::from(path)).map_err(|e| match e {
+        uefi::fs::Error::Io(io) => alloc::format!("{full}: {:?}", io.uefi_error.status()),
+        other => alloc::format!("{full}: {other}"),
+    })
+}
+
+/// The files next to this image whose names end in `suffix` (any case),
+/// in name order.
+pub fn files_with_suffix(suffix: &str) -> Result<Vec<String>, String> {
+    let dir = image_dir();
+    let sfs = boot::get_image_file_system(boot::image_handle()).map_err(|e| alloc::format!("no file system: {e:?}"))?;
+    // Dropped before returning: uefi-rs opens the volume exclusively, and
+    // `read_file` opens it again.
+    let mut fs = FileSystem::new(sfs);
+    let path = CString16::try_from(listing_path(&dir)).map_err(|_| String::from("bad directory name"))?;
+    let entries = fs.read_dir(PathBuf::from(path)).map_err(|e| alloc::format!("listing {dir} failed: {e}"))?;
+    let wanted = suffix.to_ascii_lowercase();
+    let mut names: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter(|info| !info.is_directory())
+        .map(|info| String::from(info.file_name()))
+        .filter(|name| name.to_ascii_lowercase().ends_with(&wanted))
+        .collect();
+    names.sort();
+    Ok(names)
 }
 
 pub fn print_interface(index: usize, i: &HciInterface) {

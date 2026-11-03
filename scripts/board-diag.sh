@@ -154,6 +154,12 @@ if [ "$mode" = collect ]; then
 fi
 
 # --- prepare
+sbvar="$EFIVARS/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"
+if [ -r "$sbvar" ] && [ "$(tail -c 1 "$sbvar" | od -An -tu1 | tr -d ' ')" = 1 ]; then
+  echo "Secure Boot is on: the diagnostics shell and the files it runs are unsigned, so the firmware would" >&2
+  echo "refuse them. Sign them first (sudo sbctl sign -s on each, after copying), or use scripts/board-log.sh." >&2
+  exit 1
+fi
 read -r esp_src esp_fs < <(findmnt -no SOURCE,FSTYPE /boot)
 if [ "$esp_fs" != vfat ]; then
   echo "/boot is $esp_fs, not the FAT ESP; stopping." >&2

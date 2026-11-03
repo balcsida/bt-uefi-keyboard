@@ -29,6 +29,11 @@
 #      driver, which the firmware refuses; the boot goes on to the shell. In
 #      sign mode also the unsigned driver, and one signed with a key that
 #      isn't in db.
+#  11. bonds (stage 3), five boots on one variable store: a planted bond for
+#      another device is refused; the trusted test bond is imported into a
+#      boot-services-only variable and the file deleted; the next boot uses
+#      the stored bond; a planted file next to it is ignored; the forget
+#      marker deletes the stored bond.
 # The driver's log (QEMU debug console, port 0x402) is shown after each run.
 # ONLY="1 3" runs just those cases.
 #
@@ -38,8 +43,18 @@ set -euo pipefail
 . "$(dirname "$0")/common.sh"
 ensure_firmware
 
-DRIVER="$RUST_EFI_DIR/bt-kb-dxe.efi"
 work="$ROOT/qemu/driver-test"
+mkdir -p "$work"
+# The driver under test is built to trust only the throwaway test bond
+# (write_test_bond), into its own target directory: the production build
+# in rust/target/ trusts the real bonds and nothing else.
+write_test_bond "$work/test.bond"
+export PATH="$HOME/.cargo/bin:$PATH"
+(cd "$ROOT/rust" && BT_KB_FIRMWARE="$FW_BIN" BT_KB_BOND_DIGESTS="$(python3 -I "$ROOT/scripts/bond-digest.py" "$work/test.bond")" \
+  cargo build --quiet --release --target x86_64-unknown-uefi --target-dir "$ROOT/rust/target/offline-test" \
+  -p bt-kb-dxe -p bt-kb-log -p ebs-test) || { echo "building the test driver failed" >&2; exit 1; }
+RUST_EFI_DIR="$ROOT/rust/target/offline-test/x86_64-unknown-uefi/release"
+DRIVER="$RUST_EFI_DIR/bt-kb-dxe.efi"
 trap 'pkill -f "qemu-system-x86_64 .*${work}/" 2>/dev/null || true; for d in "$work"/*/tpm; do [ -d "$d" ] && tpm_stop "$d"; done' EXIT
 if [ -n "${SB:-}" ]; then
   sb_prepare
@@ -88,10 +103,15 @@ run_qemu () {
   [ "$status" = 0 ] || echo "(QEMU exit status $status)"
 }
 
-# A made-up bond (random key) for runs that never talk to a keyboard.
+# The test bond, for runs that never talk to a keyboard.
 fake_bond () {
-  printf 'peer=C0:00:00:00:00:01\npeer_type=static\nadapter=02:00:00:00:00:02\nltk=%s\nltk_type=1\nenc_size=16\nediv=4660\nrand=1311768467463790320\nirk=\n' \
-    "$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')" > "$1/test.bond"
+  cp "$work/test.bond" "$1/test.bond"
+}
+
+# A bond for a device the test build doesn't trust.
+planted_bond () {
+  printf 'peer=C0:00:00:00:00:66\npeer_type=static\nadapter=02:00:00:00:00:02\nltk=%s\nltk_type=1\nenc_size=16\nediv=4660\nrand=1311768467463790320\nirk=\n' \
+    "$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')" > "$1/$2"
 }
 
 new_esp () {
@@ -358,4 +378,65 @@ else
     fi
   done
 fi
+fi
+
+if want 11; then
+echo
+echo "##### 11. bonds: planted ones refused, the trusted one imported and its file deleted, forgotten on request"
+b="$work/bonds"
+rm -rf "$b"
+mkdir -p "$b/esp/EFI/BOOT"
+cp "$(img "$SHELL_EFI")" "$b/esp/EFI/BOOT/BOOTX64.EFI"
+cp "$(img "$DRIVER")" "$FW_BIN" "$b/esp/"
+fresh_vars "$b/OVMF_VARS.4m.fd"
+startup () {
+  # These boots never reach an OS: reset the boot-loop counter each time.
+  printf '%s\r\n' '@echo -off' 'fs0:' "dmpstore -d BtKbBoots -guid $DIAG_GUID" 'echo "=== load"' 'load bt-kb-dxe.efi' 'echo "=== stored bond"' \
+    "dmpstore BtKbBond -guid $DIAG_GUID" 'echo "=== files"' 'ls fs0:\*.bond' 'echo "=== done"' 'reset -s' > "$b/esp/startup.nsh"
+}
+boot () { # boot N: one boot; its logs kept as N.*
+  startup
+  KEEP_VARS=1 run_qemu bonds
+  cp "$b/driver.log" "$b/$1.driver.log"
+  clean_log "$b/serial.log" > "$b/$1.serial.log"
+  # The driver deletes imported files from the image; mirror that.
+  mdir -i "$b/esp.img" -b ::/ 2>/dev/null | sed 's|^::/||' > "$b/$1.files"
+}
+check () { if eval "$2"; then echo "  $1: yes"; else echo "  $1: NO"; fi; }
+planted_bond "$b/esp" other.bond
+boot 1
+check "1. a planted bond for another device is refused" "grep -q 'other.bond is a bond this driver wasn.t built for' $b/1.driver.log && grep -q 'no bond:' $b/1.driver.log"
+fake_bond "$b/esp"
+boot 2
+check "2. the trusted bond is imported, its file deleted from the ESP" "grep -q 'bond imported into a variable the OS can.t read; test.bond deleted' $b/2.driver.log && ! grep -qi '^test.bond' $b/2.files"
+check "   stored without runtime access (NV+BS only)" "grep -q \"Variable NV+BS '.*:BtKbBond'\" $b/2.serial.log"
+rm -f "$b/esp/test.bond"
+boot 3
+check "3. the next boot uses the stored bond" "grep -q 'bond for C0:00:00:00:00:01 .*(stored)' $b/3.driver.log"
+# Every variable the driver writes: only BtKbBond (no RUNTIME_ACCESS) may
+# hold the link key; the others, and the log (BtKbLog), are world-readable
+# in Linux's efivarfs.
+"$(fw_tool virt-fw-vars)" --input "$b/OVMF_VARS.4m.fd" --output-json "$b/3.vars.json" >/dev/null 2>&1
+check "   no variable the OS can read holds the link key; only BtKbBond (NV+BS) does" \
+  "python3 -I - '$b/3.vars.json' '$b/3.driver.log' 7E57B0ED7E57B0ED7E57B0ED7E57B0ED <<'PY'
+import json, sys
+vars_json, log, ltk = sys.argv[1], sys.argv[2], bytes.fromhex(sys.argv[3])
+ours = [v for v in json.load(open(vars_json))['variables'] if v['guid'].lower() == '$DIAG_GUID']
+bad = [v['name'] for v in ours if v['attr'] & 0x4 and any(k in bytes.fromhex(v['data']) for k in (ltk, ltk[::-1]))]
+bond = [v for v in ours if v['name'] == 'BtKbBond']
+text = open(log, encoding='latin-1').read().lower()
+leaked = any(k.hex() in text.replace(' ', '') for k in (ltk, ltk[::-1]))
+ok = not bad and len(bond) == 1 and bond[0]['attr'] == 0x3 and ltk in bytes.fromhex(bond[0]['data']) and not leaked
+print('   runtime variables:', sorted(v['name'] for v in ours if v['attr'] & 0x4), file=sys.stderr)
+sys.exit(0 if ok else 1)
+PY"
+boot 4
+check "4. a planted file next to the stored bond is ignored" "grep -q 'other.bond is a bond this driver wasn.t built for' $b/4.driver.log && grep -q '(stored)' $b/4.driver.log"
+rm -f "$b/esp/other.bond"
+: > "$b/esp/bt-kb-dxe.forget"
+boot 5
+check "5. the forget marker deletes the stored bond and itself" "grep -q 'stored bond deleted' $b/5.driver.log && ! grep -qi 'bt-kb-dxe.forget' $b/5.files && ! grep -q \"Variable .*:BtKbBond'\" $b/5.serial.log"
+rm -f "$b/esp/bt-kb-dxe.forget"
+boot 6
+check "6. afterwards there is no bond" "grep -q 'no bond:' $b/6.driver.log"
 fi

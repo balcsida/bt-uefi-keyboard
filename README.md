@@ -59,6 +59,7 @@ scripts/qemu-driver-test.sh        # driver, offline: self-test typing, no-devic
                                    #   (ONLY="1 7" runs some)
 SB=1 TPM=1 scripts/qemu-driver-test.sh  # the same with Secure Boot on (test keys) and a TPM 2.0 (swtpm)
 scripts/eventlog.py driver FILE    # a TCG event log: where bt-kb-dxe loaded, separators, PCR 7 as it saw it
+scripts/bond-digest.py FILE.bond   # the digest a driver build pins for a bond (build-rust.sh pins qemu/keys/*.bond)
 scripts/qemu-hw-driver.sh [180]    # REAL CONTROLLER: driver loaded in the shell (QEMU window); end with ebs-test.efi or reset
 scripts/qemu-hw-boot.sh [240]      # REAL CONTROLLER: driver loaded at boot (Driver####, QEMU window, driver log in the
                                    #   terminal); press F2 on the keyboard for the boot menu, try setup, end with Reset.
@@ -109,7 +110,9 @@ out of git:
 - **No address in the code:** `bt-kb-probe` and `bt-le-scan` take the
   keyboard from the bond file next to them, as the driver does.
 - **Bonds:** exported keyboard bonds hold the link key and stay in
-  `qemu/keys/`, also git-ignored.
+  `qemu/keys/`, also git-ignored. On the board, the driver moves the bond
+  into a variable the OS can't read and deletes the file (see
+  [Security](#security)).
 
 ## Controller wedge (Nov 1)
 
@@ -170,6 +173,8 @@ out of git:
 | 0. Test harness | Nothing by itself: Secure Boot (OVMF with SMM, test keys, signed images) and a TPM 2.0 (swtpm) in the QEMU runs, so the later stages can be tested before they reach the board. The driver logs PCR 7, which separators were already measured and its own load event when it starts, and `btlog -eventlog` saves the event log for `scripts/eventlog.py`. | Done (Nov 3): Secure Boot in sign and hash mode, the TPM with swtpm. QEMU's TPM emulation hangs about one boot in ten, also without the driver; the harness retries those. |
 | 1. The link (`uefi-bt/src/tap.rs`) | **Goal 4:** reports that arrive before encryption are dropped and counted, not replayed once the link is encrypted. **Goal 5:** the driver never pairs; it refuses LE Enable Encryption with any key but the bonded one, and drops Security Manager (SMP) packets both ways. Without that, TrouBLE 0.8 starts a fresh Just Works pairing when the bonded key fails, so a device answering with the keyboard's address could pair and type. | Done (Nov 3); host tests |
 | 2. Secure Boot and the firmware image | **Goal 1**, as far as Secure Boot reaches: with your own keys enrolled (sbctl), the firmware runs bt-kb-dxe only if your db key signed it, and refuses a replaced or tampered driver; the boot goes on without it. The MT7922 firmware image next to the driver, which Secure Boot doesn't cover, must match the SHA-256 the driver was built with, or the driver refuses it before parsing it. | Done offline (Nov 3): the Secure Boot tests pass with signed images (sbsign) and with hashes in db |
+| 3. Bonds (`bt-kb-dxe/src/bondstore.rs`) | **Goal 1** for the keyboard: a build trusts only the bonds whose digests it was built with, so a bond file dropped on the ESP for another device is ignored. **Goal 2** without a TPM: the driver moves a trusted bond file into a variable the OS can't read or write (`BtKbBond`, no RUNTIME_ACCESS) and deletes the file from the ESP. No variable the OS can read holds key material. | Done offline (Nov 3) |
+| 4. TPM sealing | **Goal 3:** the stored key sealed to the TPM, useless off this machine and not unsealable once the OS runs. | Not started: needs swtpm and tpm2-tools to test, and a decision on its default policy. PCR 7's value before its separator is never what PCR 7 holds when a Driver#### runs, because EDK2 measures that separator before any image is verified, as the TCG spec requires. |
 
 - **When keys count:** the tap treats the link as encrypted only after an
   Encryption Change (v1 or v2) with status 0x00 and encryption on. It must
@@ -228,6 +233,60 @@ out of git:
     and for GPU option ROMs), anything Microsoft signed runs too, so goal 1
     also rests on a current dbx.
 
+### Bonds (stage 3)
+
+- **Trusted bonds:** a driver build trusts only the bonds it was built
+  with. `build-rust.sh` passes the digests of `qemu/keys/*.bond` in
+  `BT_KB_BOND_DIGESTS` (`scripts/bond-digest.py` computes them).
+  - **The digest:** SHA-256 of a domain tag and the whole bond: identity
+    address and type, adapter, LTK, key type and size, EDIV, Rand. It
+    reveals nothing about the key.
+  - **Why it holds:** anyone who can write the ESP can drop a bond file,
+    but only a driver signed with the db key can trust it.
+  - **Why digests, not signed bonds:** I chose this over Ed25519-signed
+    bonds. There's one root of trust (the db key) instead of a second
+    offline key, and no asymmetric crypto or signature parsing in the
+    firmware.
+  - **The price:** re-pairing means rebuilding and re-signing the driver.
+  - **Offline tests:** they build the driver into `rust/target/offline-test/`,
+    trusting a throwaway test bond with a public, made-up key. A
+    production build must never trust that bond: anyone could then type.
+- **No plaintext key on the ESP:** `board-install.sh` puts the bond file
+  next to the driver. At the next boot the driver copies it into
+  `BtKbBond`, NV+BS without RUNTIME_ACCESS, so Linux and Windows can
+  neither read nor write it. Once the copy reads back right, the driver
+  deletes the file. Later boots read the variable and check it against
+  the build again.
+  - **Re-pairing:** export the new bond, rebuild, reinstall; the new file
+    replaces the stored bond.
+  - **Untrusted files:** they are logged and left alone.
+- **Removing:** the OS can't delete a boot-services-only variable, so
+  `board-install.sh --remove` takes two steps.
+  1. It deletes any bond file and leaves `bt-kb-dxe.forget`. At the next
+     boot the driver then deletes `BtKbBond` and the marker, and stops.
+  2. Run after that boot, it removes the rest.
+  - **`--force`:** removes everything at once. The stored bond then stays
+    in NVRAM until a UEFI shell deletes it:
+    `dmpstore -d BtKbBond -guid 5223227b-ac96-454e-9bca-f15199748a3c`.
+- **Variables the OS can see:** efivarfs files are world-readable in Linux.
+  The driver writes only these with RUNTIME_ACCESS, and none holds key
+  material:
+  - **`BtKbLog`:** the log. It never prints the key (`ExportedBond`'s
+    `Debug` leaves it out) or typing; only F-keys, Esc and Delete are
+    named.
+  - **`BtKbLastBoot`:** the boot record.
+  - **`BtKbBoots`:** the counter.
+  - **`BtKbGatt`:** handles, report layout, keyboard address.
+  - **`BtKbPanic`:** a panic message. Fixed text from the code; none of
+    the driver's panics formats key material.
+  - **Test:** offline case 11 checks this after a boot with a stored bond.
+    No variable with RUNTIME_ACCESS and nothing in the log contains the
+    test key, in either byte order; `BtKbBond` does.
+- **Key copies in memory:** the driver wipes its copy of the key at
+  BeforeExitBootServices, because the OS gets boot services memory as it
+  is. The guard's copy goes at the hand-off. TrouBLE's own copy of the bond
+  is stage 4's job.
+
 ### Residual risks
 
 - **A keystroke in firmware no longer proves physical presence.** Anyone
@@ -240,6 +299,10 @@ out of git:
   Rust keeps that memory-safe, and events are validated before TrouBLE
   sees them, but a parser panic still restarts the machine (denial of
   service).
+- **Building on this machine:** the driver is built where root rules. Root
+  could change what gets built (the trusted bond digests, say) before you
+  sign it with an off-machine key. Signing protects only what you meant to
+  sign if the build itself can be trusted.
 
 ## License
 

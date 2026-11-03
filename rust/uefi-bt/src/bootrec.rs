@@ -28,6 +28,8 @@ pub struct BootRecord {
     /// Driver times below are ms since the driver loaded.
     pub ready_ms: Option<u64>,
     pub failure: Option<(u64, String)>,
+    /// Where the bond came from (`bondstore::Source::text`).
+    pub bond: Option<&'static str>,
     /// Links left from before this boot, closed at bring-up.
     pub links_closed: u32,
     pub connections: u32,
@@ -83,6 +85,9 @@ impl BootRecord {
         let _ = write!(s, "loaded {} after reset {origin}", Secs(self.loaded_at_ms));
         if self.links_closed > 0 {
             let _ = write!(s, "; closed {} link(s) left from before", self.links_closed);
+        }
+        if let Some(source) = self.bond {
+            let _ = write!(s, "; bond {source}");
         }
         match self.tpm_separators {
             Some(None) => s.push_str("; no TPM"),
