@@ -133,3 +133,23 @@ out of git:
 - **Event throughput:** the async pipe gets one 16-byte packet per firmware timer tick, about 100 packets/s with a 10 ms tick. Scans therefore use duplicate filtering (`-dups` turns it off).
 - **Wedge recovery untested:** the MT7922 subsystem reset (`-recover`) is Linux's recovery after a firmware crash. Whether it revives a controller that has stopped answering HCI is untested.
 - **Untested security path:** TrouBLE's security manager (`security` feature) hasn't been tried. It is needed to start encryption with the keyboard's stored key in milestone 3.
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <https://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
+dual licensed as above, without any additional terms or conditions.
+
+Not covered by this:
+
+- **Submodules** keep their own licenses: EDK2 (`edk2/`) is BSD-2-Clause-Patent, and NimBLE (`BtKbPkg/Library/NimbleLib/mynewt-nimble`) is Apache-2.0.
+- **`BtKbPkg/Library/NimbleLib/Port/include/syscfg/syscfg.h`** is a modified copy of NimBLE's configuration header and stays under Apache-2.0 only, as its header says.
+- **The MediaTek firmware image** isn't part of this repository; the scripts take it from the system's linux-firmware package.
+- **Built binaries** also contain the Rust crates they depend on, under those crates' own licenses (mostly MIT OR Apache-2.0; `cargo metadata` lists them).
