@@ -6,3 +6,6 @@
 *.bin
 /rust/target/
 /board/
+# Local-only data: real hardware identifiers, local settings (see private/README.md)
+/private/
+__pycache__/
