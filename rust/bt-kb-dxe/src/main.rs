@@ -206,6 +206,8 @@ struct Driver {
     /// how many were logged).
     other_reports: Vec<(u16, u8)>,
     timing: Timing,
+    /// ACL packets the host stack had sent at the last timing line.
+    acl_sent_logged: u64,
     /// A timing line to log at the end of this tick (events are handled
     /// while the controller is borrowed).
     timing_due: Option<&'static str>,
@@ -654,6 +656,7 @@ fn start_driver(controller: Handle, agent: Handle) -> Result<(), Status> {
             wait_notes: 0,
             other_reports: Vec::new(),
             timing: Timing::default(),
+            acl_sent_logged: 0,
             timing_due: None,
         });
     });
@@ -1185,6 +1188,13 @@ impl Driver {
         }
         if t.acl_data > 0 {
             let _ = write!(line, ", {} with data (max {}), {} notifications", t.acl_data, Ms(t.acl_data_max_us), t.notifications);
+        }
+        // What the host stack sent: GATT requests and their like. With the
+        // data read above it tells a keyboard that stopped answering from a
+        // host stack that stopped asking.
+        if let Some(sent) = self.hci.try_borrow().ok().map(|hci| u64::from(hci.stats.acl_out)) {
+            let _ = write!(line, "; {} ACL sent", sent.saturating_sub(self.acl_sent_logged));
+            self.acl_sent_logged = sent;
         }
         let _ = write!(line, "; {} events", t.events);
         if let Some(p) = self.hci.try_borrow().ok().and_then(|hci| hci.pipe_stats()) {

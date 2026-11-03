@@ -49,6 +49,10 @@ pub struct Shared {
 /// the controller already reported, before going on without it.
 const HOST_ENCRYPTION_GRACE: Duration = Duration::from_millis(500);
 
+/// How long GATT discovery of the keyboard may take before the connection
+/// is dropped and retried. It takes 2-3 s.
+const DISCOVERY_LIMIT: Duration = Duration::from_secs(10);
+
 /// Attribute handles found by discovery (or remembered from an earlier
 /// boot), reused on every reconnect.
 #[derive(Clone, Copy)]
@@ -294,9 +298,17 @@ async fn connected(
             let f = match *found {
                 Some(f) => f,
                 None => {
-                    let f = match with_timeout(Duration::from_secs(30), discover(&client)).await {
+                    // It takes 2-3 s. A stalled one (Nov 3: about half the
+                    // responses, then none) ends the connection sooner, so
+                    // the keyboard reconnects and tries again.
+                    let f = match with_timeout(DISCOVERY_LIMIT, discover(&client)).await {
                         Ok(result) => result?,
-                        Err(_) => return Err(String::from("discovery took longer than 30 s")),
+                        Err(_) => {
+                            return Err(alloc::format!(
+                                "discovery got nowhere within {} s (it takes 2-3 s): reconnecting",
+                                DISCOVERY_LIMIT.as_secs()
+                            ));
+                        }
                     };
                     log::info!("keyboard input report at {:#06x}: {:?}", f.layout.input, f.layout.report);
                     shared.layout.set(Some(f.layout));
