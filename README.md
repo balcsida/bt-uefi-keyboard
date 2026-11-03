@@ -96,7 +96,9 @@ back on. Bluetooth is down on the host while QEMU runs, the keyboard included. T
 `sudo setfacl -m u:$USER:rw /dev/bus/usb/BBB/DDD` (the script prints the path).
 No script uploads firmware unless `-upload` is passed explicitly. The exported
 bond is copied onto the scratch ESP only for hardware runs and deleted from it
-afterwards; delete `qemu/keys/` when you no longer need it.
+afterwards. The driver imports it into the run's variable store, though
+(`qemu/hw/`, `qemu/hw-boot/`, mode 600), so delete those stores together with
+`qemu/keys/` when you no longer need them.
 
 ## Private data
 

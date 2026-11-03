@@ -140,6 +140,9 @@ for bond in "$ROOT"/qemu/keys/*.bond; do
 done
 vars="${VARS_FILE:-$work/OVMF_VARS.4m.fd}"
 [ -n "${VARS_FILE:-}" ] || fresh_vars "$vars"
+# The driver imports the bond into this store (BtKbBond): the link key, in
+# the clear, for whoever can read the file.
+chmod 600 "$vars"
 make_esp_image "$work/esp" "$work/esp.img"
 tpm_start "$tpm_dir"
 
