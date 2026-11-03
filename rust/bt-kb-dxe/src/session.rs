@@ -210,20 +210,39 @@ async fn wait_encrypted(
 }
 
 /// Trouble with GATT on a link whose keys already work (they come through
-/// the driver's tap, with the known layout): keep the link and answer its
-/// connection events, rather than drop it and the keys typed meanwhile.
-/// LED updates stay off until the next connection.
-async fn keep_link(
-    stack: &'static Stack<'static, Ctrl, Pool>,
-    conn: &Connection<'static, Pool>,
-    shared: &'static Shared,
-    why: String,
-) -> Result<String, String> {
+/// the driver's tap, with the known layout): keep the link rather than drop
+/// it and the keys typed meanwhile. `connected`'s `watch` goes on answering
+/// the connection's events and ends the session when the link goes. LED
+/// updates stay off until the next connection.
+async fn keep_link(shared: &'static Shared, why: String) -> Result<String, String> {
     if shared.layout.get().is_none() {
         return Err(why);
     }
     log::warn!("{why}; keeping the link: keys still work, LED updates are off until it reconnects");
-    Ok(watch(stack, conn).await)
+    core::future::pending().await
+}
+
+/// A connection interval or timeout for the log: "7.5 ms".
+fn ms(d: Duration) -> String {
+    let us = d.as_micros();
+    if us % 1000 == 0 { alloc::format!("{} ms", us / 1000) } else { alloc::format!("{}.{} ms", us / 1000, us % 1000 / 100) }
+}
+
+/// Accept the keyboard's connection parameter request, and say so.
+async fn answer(stack: &'static Stack<'static, Ctrl, Pool>, req: ConnectionParamsRequest) {
+    let p = req.params().clone();
+    let result = req.accept(None, stack).await;
+    let asked = alloc::format!(
+        "interval {}-{}, latency {}, timeout {}",
+        ms(p.min_connection_interval),
+        ms(p.max_connection_interval),
+        p.max_latency,
+        ms(p.supervision_timeout)
+    );
+    match result {
+        Ok(()) => log::info!("the keyboard asked for new connection parameters ({asked}): accepted"),
+        Err(e) => log::warn!("the keyboard asked for new connection parameters ({asked}): accepting failed: {e:?}"),
+    }
 }
 
 /// One connection, from encryption to disconnection. `Ok` carries the
@@ -249,60 +268,67 @@ async fn connected(
         ),
     }
     if let Some(req) = params.take() {
-        let _ = req.accept(None, stack).await;
+        answer(stack, req).await;
     }
 
-    let client = match GattClient::<Ctrl, Pool, 8>::new(stack, conn).await {
-        Ok(client) => client,
-        Err(e) => return keep_link(stack, conn, shared, alloc::format!("starting the GATT client failed: {e:?}")).await,
-    };
-    // Layout check (or discovery) and the notification switch.
-    let setup = async {
-        if let Some(f) = found.as_mut().filter(|f| !f.verified) {
-            if still_matches(&client, f).await? {
-                log::info!("the remembered keyboard layout still matches");
-                f.verified = true;
-            } else {
-                // Keys already decoded with it can't be taken back; the
-                // tick stashes new ones until discovery is done.
-                log::warn!("the keyboard's layout changed since it was remembered: discovering it again");
-                shared.layout.set(None);
-                *found = None;
-                crate::cache::forget();
+    let gatt = async {
+        let client = match GattClient::<Ctrl, Pool, 8>::new(stack, conn).await {
+            Ok(client) => client,
+            Err(e) => return keep_link(shared, alloc::format!("starting the GATT client failed: {e:?}")).await,
+        };
+        // Layout check (or discovery) and the notification switch.
+        let setup = async {
+            if let Some(f) = found.as_mut().filter(|f| !f.verified) {
+                if still_matches(&client, f).await? {
+                    log::info!("the remembered keyboard layout still matches");
+                    f.verified = true;
+                } else {
+                    // Keys already decoded with it can't be taken back; the
+                    // tick stashes new ones until discovery is done.
+                    log::warn!("the keyboard's layout changed since it was remembered: discovering it again");
+                    shared.layout.set(None);
+                    *found = None;
+                    crate::cache::forget();
+                }
             }
-        }
-        let f = match *found {
-            Some(f) => f,
-            None => {
-                let f = match with_timeout(Duration::from_secs(30), discover(&client)).await {
-                    Ok(result) => result?,
-                    Err(_) => return Err(String::from("discovery took longer than 30 s")),
-                };
-                log::info!("keyboard input report at {:#06x}: {:?}", f.layout.input, f.layout.report);
-                shared.layout.set(Some(f.layout));
-                *found = Some(f);
-                crate::cache::store(&f);
-                f
+            let f = match *found {
+                Some(f) => f,
+                None => {
+                    let f = match with_timeout(Duration::from_secs(30), discover(&client)).await {
+                        Ok(result) => result?,
+                        Err(_) => return Err(String::from("discovery took longer than 30 s")),
+                    };
+                    log::info!("keyboard input report at {:#06x}: {:?}", f.layout.input, f.layout.report);
+                    shared.layout.set(Some(f.layout));
+                    *found = Some(f);
+                    crate::cache::store(&f);
+                    f
+                }
+            };
+            notifications_on(&client, f.cccd).await?;
+            Ok(f)
+        };
+        let session = async {
+            match setup.await {
+                Ok(f) => match leds(&client, f.output, shared).await {},
+                // The GATT client keeps running here, so ATT traffic still
+                // flows.
+                Err(why) => keep_link(shared, why).await,
             }
         };
-        notifications_on(&client, f.cccd).await?;
-        Ok(f)
-    };
-    let session = async {
-        match setup.await {
-            Ok(f) => match select(watch(stack, conn), leds(&client, f.output, shared)).await {
-                Either::First(reason) => Ok(reason),
-                Either::Second(never) => match never {},
-            },
-            // The GATT client keeps running here, so ATT traffic still flows.
-            Err(why) => keep_link(stack, conn, shared, why).await,
+        match select(client.task(), session).await {
+            Either::First(Err(BleHostError::BleHost(Error::Disconnected))) => Ok(String::from("link lost")),
+            Either::First(other) => keep_link(shared, alloc::format!("GATT client stopped: {other:?}")).await,
+            Either::Second(result) => result,
         }
     };
-    match select(client.task(), session).await {
-        Either::First(result) => match result {
-            Err(BleHostError::BleHost(Error::Disconnected)) => Ok(String::from("link lost")),
-            other => keep_link(stack, conn, shared, alloc::format!("GATT client stopped: {other:?}")).await,
-        },
+    // The connection's events are answered from here to the end of the
+    // connection, also while the GATT client starts (its MTU exchange) and
+    // the setup runs: a keyboard may hold back its GATT responses until its
+    // connection parameter request is answered (Nov 3: a first discovery
+    // stalled for 30 s, the request still unanswered when it timed out).
+    match select(watch(stack, conn), gatt).await {
+        Either::First(reason) => Ok(reason),
         Either::Second(result) => result,
     }
 }
@@ -318,14 +344,13 @@ async fn still_matches(client: &GattClient<'_, Ctrl, Pool, 8>, f: &Found) -> Res
     }
 }
 
-/// Connection events until the link goes: accept parameter requests.
+/// Connection events until the link goes: parameter requests are
+/// answered at once.
 async fn watch(stack: &'static Stack<'static, Ctrl, Pool>, conn: &Connection<'static, Pool>) -> String {
     loop {
         match conn.next().await {
             ConnectionEvent::Disconnected { reason } => return alloc::format!("{reason:?}"),
-            ConnectionEvent::RequestConnectionParams(req) => {
-                let _ = req.accept(None, stack).await;
-            }
+            ConnectionEvent::RequestConnectionParams(req) => answer(stack, req).await,
             _ => {}
         }
     }
