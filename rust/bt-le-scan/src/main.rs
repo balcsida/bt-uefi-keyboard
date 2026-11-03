@@ -25,14 +25,14 @@ use mtk_bt::{FirmwareImage, Mtk};
 use trouble_host::prelude::*;
 use uefi::prelude::*;
 use uefi::{println, system};
-use uefi_bt::app::{args, bring_up_mediatek, hand_off, print_diagnostics, print_pipe_stats, read_file};
+use uefi_bt::app::{args, bring_up_mediatek, first_file_with_suffix, hand_off, print_diagnostics, print_pipe_stats, read_file};
+use uefi_bt::bond::ExportedBond;
 use uefi_bt::embassy::{AclMode, UsbHciTransport};
 use uefi_bt::{clock, UsbHci};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_FW: &str = "BT_RAM_CODE_MT7922_1_1_hdr.bin";
 const DEFAULT_SECONDS: u64 = 30;
-const DEFAULT_TARGET: [u8; 6] = [0x01, 0x00, 0x00, 0x00, 0x00, 0xC0]; // C0:00:00:00:00:01, little-endian
 const MAX_DEVICES: usize = 64;
 /// The host stack must have started scanning this long after it starts.
 const SETUP_LIMIT_SECS: u64 = 10;
@@ -41,7 +41,9 @@ struct Options {
     seconds: u64,
     active: bool,
     all: bool,
-    target: [u8; 6],
+    /// Little-endian. `None`: the keyboard of the first *.bond next to the
+    /// app, if there is one.
+    target: Option<[u8; 6]>,
     fw: String,
     allow_upload: bool,
     keep: bool,
@@ -56,7 +58,7 @@ fn usage() {
     println!("usage: bt-le-scan [options]");
     println!("  -t <seconds>   scan time (default {DEFAULT_SECONDS})");
     println!("  -active        active scan (asks for scan responses, often with names)");
-    println!("  -addr <addr>   bonded device to look for (default C0:00:00:00:00:01)");
+    println!("  -addr <addr>   device to look for (default: the keyboard of the first *.bond next to the app)");
     println!("  -all           print every report, not just new devices");
     println!("  -dups          let the controller report duplicates (default: one report per advertiser)");
     println!("  -fw <file>     firmware file next to the app (default {DEFAULT_FW})");
@@ -86,7 +88,7 @@ fn parse_options(args: &[String]) -> Option<Options> {
         seconds: DEFAULT_SECONDS,
         active: false,
         all: false,
-        target: DEFAULT_TARGET,
+        target: None,
         fw: String::from(DEFAULT_FW),
         allow_upload: false,
         keep: false,
@@ -100,7 +102,7 @@ fn parse_options(args: &[String]) -> Option<Options> {
             "-t" => o.seconds = it.next()?.parse().ok()?,
             "-active" => o.active = true,
             "-all" => o.all = true,
-            "-addr" => o.target = parse_addr(it.next()?)?,
+            "-addr" => o.target = Some(parse_addr(it.next()?)?),
             "-fw" => o.fw = it.next()?.clone(),
             "-upload" => o.allow_upload = true,
             "-keep" => o.keep = true,
@@ -174,7 +176,7 @@ struct Seen {
 }
 
 struct ScanLog {
-    target: [u8; 6],
+    target: Option<[u8; 6]>,
     all: bool,
     verbose: bool,
     devices: RefCell<Vec<Seen>>,
@@ -199,7 +201,7 @@ impl ScanLog {
         if let Some(a) = ad.appearance {
             text += &alloc::format!("  appearance {a:#06x}");
         }
-        if *addr == self.target {
+        if Some(*addr) == self.target {
             text += "   <== bonded keyboard";
         }
         println!("{text}");
@@ -239,7 +241,7 @@ impl EventHandler for ScanLog {
             }
             drop(devices);
 
-            if addr == self.target && *self.target_printed.borrow() < 5 {
+            if Some(addr) == self.target && *self.target_printed.borrow() < 5 {
                 *self.target_printed.borrow_mut() += 1;
                 self.line("  * ", &addr, report.addr_kind, report.rssi, report.event_kind, &ad);
                 if self.verbose {
@@ -277,17 +279,45 @@ fn print_summary(log: &ScanLog) {
         if d.ad.hid {
             text += "  HID";
         }
-        if d.addr == log.target {
+        if Some(d.addr) == log.target {
             text += "   <== bonded keyboard";
             seen_target = true;
         }
         println!("{text}");
     }
-    println!(
-        "Bonded keyboard {}: {}",
-        addr_text(&log.target),
-        if seen_target { "SEEN" } else { "not seen (press a key on it during the scan)" }
-    );
+    if let Some(target) = &log.target {
+        println!(
+            "Bonded keyboard {}: {}",
+            addr_text(target),
+            if seen_target { "SEEN" } else { "not seen (press a key on it during the scan)" }
+        );
+    }
+}
+
+/// The device to look for: `-addr`, else the keyboard of the first bond
+/// file next to the app (scripts/export-bond.sh), else none.
+fn resolve_target(given: Option<[u8; 6]>) -> Option<[u8; 6]> {
+    if given.is_some() {
+        return given;
+    }
+    let found = first_file_with_suffix(".bond").and_then(|name| {
+        let data = read_file(&name)?;
+        let text = core::str::from_utf8(&data).map_err(|_| alloc::format!("{name} is not text"))?;
+        match ExportedBond::parse(text) {
+            Ok(bond) => Ok((name, bond.peer)),
+            Err(e) => Err(alloc::format!("{name}: {e}")),
+        }
+    });
+    match found {
+        Ok((name, peer)) => {
+            println!("Looking for {} (the keyboard in {name})", addr_text(&peer));
+            Some(peer)
+        }
+        Err(e) => {
+            println!("No device to look for ({e}); listing what advertises");
+            None
+        }
+    }
 }
 
 fn key_pressed() -> bool {
@@ -352,6 +382,7 @@ fn main() -> Status {
     log::set_max_level(if opts.verbose { log::LevelFilter::Debug } else { log::LevelFilter::Warn });
     println!("bt-le-scan {VERSION}");
     clock::calibrate();
+    let target = resolve_target(opts.target);
 
     let fw_data = match read_file(&opts.fw) {
         Ok(data) => data,
@@ -387,7 +418,7 @@ fn main() -> Status {
     // If TrouBLE panics, the panic handler hands the controller back.
     uefi_bt::emergency::register(&hci, opts.recover);
     let log = ScanLog {
-        target: opts.target,
+        target,
         all: opts.all,
         verbose: opts.verbose,
         devices: RefCell::new(Vec::new()),
