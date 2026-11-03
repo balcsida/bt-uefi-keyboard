@@ -261,8 +261,14 @@ out of git:
   next to the driver. At the next boot the driver copies it into
   `BtKbBond`, NV+BS without RUNTIME_ACCESS, so Linux and Windows can
   neither read nor write it. Once the copy reads back right, the driver
-  deletes the file. Later boots read the variable and check it against
-  the build again.
+  overwrites the file with zeros and deletes it. Later boots read the
+  variable and check it against the build again.
+  - **Why overwrite:** a plain delete only frees the FAT directory entry,
+    and the key stays in the ESP's free clusters. FAT has no
+    copy-on-write, so the overwrite lands in the file's own clusters.
+    `board-install.sh` overwrites the bond files it removes, too
+    (`shred`). Offline case 11 checks the whole ESP image, free space
+    included; with a plain delete the key is still there.
   - **Re-pairing:** export the new bond, rebuild, reinstall; the new file
     replaces the stored bond.
   - **Untrusted files:** they are logged and left alone.
@@ -403,6 +409,11 @@ out of git:
 - **Copies outside the driver:** the controller and the firmware's USB
   buffers see the key in LE Enable Encryption, and RAM can be read in a
   cold-boot attack.
+- **Old copies on disk:** bond files deleted before the overwrite (Nov 3)
+  may still sit in the ESP's free space: `board-install.sh` replaced the
+  file with `rm` at every reinstall. A flash disk can also keep remapped
+  blocks out of reach of any software. Re-pairing the keyboard once
+  everything is set up makes all of them useless.
 - **Building on this machine:** the driver is built where root rules. Root
   could change what gets built (the trusted bond digests, say) before you
   sign it with an off-machine key. Signing protects only what you meant to

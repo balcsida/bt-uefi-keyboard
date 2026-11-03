@@ -106,6 +106,14 @@ remove_entries () {
   done
 }
 
+# A bond file on the ESP: overwritten, then deleted. rm alone leaves the
+# key in the FAT's free clusters; vfat has no copy-on-write, so shred's
+# overwrite lands in the file's own clusters.
+delete_bond_file () {
+  echo "Overwriting and deleting $1 (it holds the link key)"
+  run shred -u -n 1 -z "$1"
+}
+
 # efivarfs marks variables immutable; deleting needs chattr -i first.
 delete_variable () {
   local f="$EFIVARS/$1-$VENDOR"
@@ -128,7 +136,7 @@ if [ "$mode" = remove ]; then
   fi
   if [ -z "$force" ] && [ -n "$installed" ] && [[ "$record" != *"bond was forgotten"* ]]; then
     for f in "$DEST"/*.bond; do
-      [ -e "$f" ] && { echo "Deleting $f (it holds the link key)"; run rm -f "$f"; }
+      [ -e "$f" ] && delete_bond_file "$f"
     done
     if [ -e "$marker" ]; then
       echo "Waiting for the driver: $marker is still there, so it hasn't run since the first --remove."
@@ -148,7 +156,7 @@ if [ "$mode" = remove ]; then
     [ -e "$DEST/$f" ] && run rm -f "$DEST/$f"
   done
   for f in "$DEST"/*.bond; do
-    [ -e "$f" ] && run rm -f "$f"
+    [ -e "$f" ] && delete_bond_file "$f"
   done
   [ -d "$DEST" ] && run rmdir "$DEST"
   delete_variable BtKbBoots
@@ -288,7 +296,7 @@ else
 fi
 # The driver uses the first *.bond in its directory: keep exactly one.
 for f in "$DEST"/*.bond; do
-  [ -e "$f" ] && run rm -f "$f"
+  [ -e "$f" ] && delete_bond_file "$f"
 done
 # Sealed to the TPM (scripts/tpm-seal.sh) without a fallback copy: the
 # bond file never goes on the ESP; the seal is renewed for the new driver.
@@ -298,7 +306,7 @@ if [ -n "$sealed_only" ]; then
   echo "The bond is sealed to the TPM without a fallback copy (fallback=no): not copying ${bonds[0]##*/}."
 else
   run cp "${bonds[0]}" "$DEST/"
-  echo "The driver imports the bond at the next boot and deletes ${bonds[0]##*/} from the ESP."
+  echo "The driver imports the bond at the next boot, then overwrites and deletes ${bonds[0]##*/} on the ESP."
 fi
 if [ -f "$DEST/bt-kb-dxe.sealed" ]; then
   # The new driver measures differently: predict its PCR 2 now, so the

@@ -31,7 +31,8 @@
 #      isn't in db.
 #  11. bonds (stage 3), five boots on one variable store: a planted bond for
 #      another device is refused; the trusted test bond is imported into a
-#      boot-services-only variable and the file deleted; the next boot uses
+#      boot-services-only variable and the file overwritten and deleted (the
+#      key is nowhere in the ESP image, free space included); the next boot uses
 #      the stored bond; a planted file next to it is ignored; the forget
 #      marker deletes the stored bond.
 #  12. the sealed bond (stage 4, needs TPM=1), eight boots on one variable
@@ -421,7 +422,17 @@ boot 1
 check "1. a planted bond for another device is refused" "grep -q 'other.bond is a bond this driver wasn.t built for' $b/1.driver.log && grep -q 'no bond:' $b/1.driver.log"
 fake_bond "$b/esp"
 boot 2
-check "2. the trusted bond is imported, its file deleted from the ESP" "grep -q 'bond imported into a variable the OS can.t read; test.bond deleted' $b/2.driver.log && ! grep -qi '^test.bond' $b/2.files"
+check "2. the trusted bond is imported, its file deleted from the ESP" "grep -q 'bond imported into a variable the OS can.t read; test.bond overwritten and deleted' $b/2.driver.log && ! grep -qi '^test.bond' $b/2.files"
+# A plain delete leaves a file's contents in the FAT's free clusters. The
+# control: an image made with the file in it shows the key to the scan.
+has_test_key () {
+  python3 -I -c 'import sys; d = open(sys.argv[1], "rb").read(); k = "7E57B0ED7E57B0ED7E57B0ED7E57B0ED"
+sys.exit(0 if any(x in d for x in (k.encode(), k.lower().encode(), bytes.fromhex(k))) else 1)' "$1"
+}
+make_esp_image "$b/esp" "$b/control.img"
+check "   overwritten first: the key is nowhere in the ESP image, free space included" \
+  "has_test_key $b/control.img && ! has_test_key $b/esp.img"
+rm -f "$b/control.img"
 check "   stored without runtime access (NV+BS only)" "grep -q \"Variable NV+BS '.*:BtKbBond'\" $b/2.serial.log"
 rm -f "$b/esp/test.bond"
 boot 3

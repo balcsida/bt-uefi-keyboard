@@ -9,7 +9,8 @@
 //!   `board-install.sh`) is copied into the variable `BtKbBond`. The
 //!   variable has no RUNTIME_ACCESS, so the OS can neither read nor write
 //!   it; only pre-boot code can. Once it reads back right, the file is
-//!   deleted from the ESP.
+//!   overwritten and deleted from the ESP (a plain delete would leave the
+//!   key in the FAT's free clusters).
 //! - **Later boots** read `BtKbBond`, and check it against the build again.
 //! - **Re-pairing:** export the new bond, rebuild (the build then trusts
 //!   it), reinstall. The driver imports the new file over the old bond.
@@ -184,8 +185,8 @@ fn import_files(pins: &[[u8; 32]], store_it: bool) -> Option<(ExportedBond, Sour
         }
         if !store_it {
             bond.wipe();
-            match app::delete_file(&name) {
-                Ok(()) => info!("{name} deleted without importing it: the bond is sealed to the TPM, and the seal allows no copy"),
+            match app::wipe_and_delete_file(&name) {
+                Ok(()) => info!("{name} overwritten and deleted without importing it: the bond is sealed to the TPM, and the seal allows no copy"),
                 Err(e) => error!("deleting {name} failed ({e}): the link key is still on the ESP"),
             }
             continue;
@@ -194,9 +195,9 @@ fn import_files(pins: &[[u8; 32]], store_it: bool) -> Option<(ExportedBond, Sour
             error!("the bond couldn't be stored in NVRAM: using {name}, which stays on the ESP");
             return Some((bond, Source::File));
         }
-        match app::delete_file(&name) {
-            Ok(()) => info!("bond imported into a variable the OS can't read; {name} deleted from the ESP"),
-            Err(e) => error!("bond imported, but deleting {name} failed ({e}): the link key is still on the ESP"),
+        match app::wipe_and_delete_file(&name) {
+            Ok(()) => info!("bond imported into a variable the OS can't read; {name} overwritten and deleted from the ESP"),
+            Err(e) => error!("bond imported, but wiping {name} failed ({e}): the link key may still be on the ESP"),
         }
         return Some((bond, Source::Imported));
     }

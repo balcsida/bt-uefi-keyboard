@@ -94,6 +94,43 @@ pub fn delete_file(name: &str) -> Result<(), String> {
     })
 }
 
+/// Overwrite a file on this image's volume with zeros, then delete it, for
+/// files that held key material. A plain delete only frees the directory
+/// entry: the contents stay in the volume's free clusters until something
+/// reuses them. FAT has no copy-on-write, so writing within the file's
+/// length lands in the clusters it has. (A flash disk may still keep the
+/// old data in blocks it remapped, out of reach of anything above it.) The
+/// file is deleted even if overwriting it failed; the error says so.
+pub fn wipe_and_delete_file(name: &str) -> Result<(), String> {
+    use uefi::proto::media::file::{File, FileAttribute, FileInfo, FileMode};
+    let full = if name.starts_with('\\') { String::from(name) } else { image_dir() + name };
+    let path = CString16::try_from(full.as_str()).map_err(|_| String::from("bad path"))?;
+    let mut sfs = boot::get_image_file_system(boot::image_handle()).map_err(|e| alloc::format!("{full}: {e:?}"))?;
+    let mut root = sfs.open_volume().map_err(|e| alloc::format!("{full}: opening the volume: {:?}", e.status()))?;
+    let handle = root
+        .open(&path, FileMode::ReadWrite, FileAttribute::empty())
+        .map_err(|e| alloc::format!("{full}: {:?}", e.status()))?;
+    let mut file = handle.into_regular_file().ok_or_else(|| alloc::format!("{full} is a directory"))?;
+    let wiped = (|| {
+        let size = file.get_boxed_info::<FileInfo>().map_err(|e| alloc::format!("its size: {:?}", e.status()))?.file_size();
+        file.set_position(0).map_err(|e| alloc::format!("seeking: {:?}", e.status()))?;
+        let zeros = [0u8; 512];
+        let mut left = size;
+        while left > 0 {
+            let n = left.min(zeros.len() as u64) as usize;
+            file.write(&zeros[..n]).map_err(|e| alloc::format!("overwriting: {:?}", e.status()))?;
+            left -= n as u64;
+        }
+        file.flush().map_err(|e| alloc::format!("flushing: {:?}", e.status()))
+    })();
+    let deleted = file.delete().map_err(|e| alloc::format!("{full}: deleting: {:?}", e.status()));
+    match (wiped, deleted) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(why), Ok(())) => Err(alloc::format!("{full}: {why}; deleted anyway, so its contents may stay in free space")),
+        (_, Err(why)) => Err(why),
+    }
+}
+
 /// The files next to this image whose names end in `suffix` (any case),
 /// in name order.
 pub fn files_with_suffix(suffix: &str) -> Result<Vec<String>, String> {
