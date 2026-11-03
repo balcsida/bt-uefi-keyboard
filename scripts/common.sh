@@ -86,7 +86,7 @@ add_driver_option () {
     -drive if=none,id=esp,format=raw,file="$tmp/esp.img" -device virtio-blk-pci,drive=esp \
     -device qemu-xhci,id=xhci -net none -serial mon:stdio > "$tmp/serial.log" 2>&1 || true
   clean_log "$tmp/serial.log" | sed -n '/=== driver options/,$p' | grep -E 'DevPath' | head -2
-  clean_log "$tmp/serial.log" | grep -q 'DevPath.*bt-kb-dxe.efi' && ok=1
+  grep -q 'DevPath.*bt-kb-dxe.efi' < <(clean_log "$tmp/serial.log") && ok=1
   rm -rf "$tmp"
   [ "$ok" = 1 ]
 }

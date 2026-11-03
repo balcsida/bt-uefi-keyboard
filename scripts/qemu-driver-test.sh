@@ -206,7 +206,7 @@ printf '%s\r\n' '@echo -off' 'fs0:' 'echo "=== shell reached"' 'reset -s' > "$wo
 fresh_vars "$work/hotkey/OVMF_VARS.4m.fd"
 add_driver_option "$work/hotkey/OVMF_VARS.4m.fd" || echo "adding the Driver#### option FAILED"
 KEEP_VARS=1 EXTRA_QEMU="-boot menu=on,splash-time=8000" run_qemu hotkey
-if clean_log "$work/hotkey/serial.log" | grep -q 'Please select boot device'; then
+if grep -q 'Please select boot device' < <(clean_log "$work/hotkey/serial.log"); then
   echo "boot menu: opened by the hotkey"
 else
   echo "boot menu: NOT SEEN (the hotkey didn't work)"
@@ -353,7 +353,7 @@ clean_log "$work/fwpin/serial.log" | sed -n '/^=== load/,/^=== drivers/p' | head
 echo "--- driver log"
 cat "$work/fwpin/driver.log"
 if grep -q "isn't the image this driver was built for" "$work/fwpin/driver.log" \
-  && ! clean_log "$work/fwpin/serial.log" | grep -q 'Bluetooth LE keyboard'; then
+  && ! grep -q 'Bluetooth LE keyboard' < <(clean_log "$work/fwpin/serial.log"); then
   echo "firmware pin: the changed image was refused, the driver didn't stay"
 else
   echo "firmware pin: NOT REFUSED"
@@ -383,8 +383,8 @@ else
     fresh_vars "$work/sb-$variant/OVMF_VARS.4m.fd"
     add_driver_option "$work/sb-$variant/OVMF_VARS.4m.fd" >/dev/null || echo "adding the Driver#### option FAILED"
     KEEP_VARS=1 run_qemu "sb-$variant"
-    if [ ! -s "$work/sb-$variant/driver.log" ] && clean_log "$work/sb-$variant/serial.log" | grep -q '^=== shell reached' \
-      && ! clean_log "$work/sb-$variant/serial.log" | grep -q 'Bluetooth LE keyboard'; then
+    if [ ! -s "$work/sb-$variant/driver.log" ] && grep -q '^=== shell reached' < <(clean_log "$work/sb-$variant/serial.log") \
+      && ! grep -q 'Bluetooth LE keyboard' < <(clean_log "$work/sb-$variant/serial.log"); then
       echo "Secure Boot, $variant driver: refused, boot went on to the shell"
     else
       echo "Secure Boot, $variant driver: NOT REFUSED (or the boot stopped)"

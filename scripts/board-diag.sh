@@ -190,7 +190,7 @@ done
 # linux.nsh removes the first driver entry: it has to be ours.
 order="$(efibootmgr -r 2>/dev/null | sed -n 's/^DriverOrder: //p')"
 first="${order%%,*}"
-if [ -n "$first" ] && ! efibootmgr -r 2>/dev/null | grep -q "^Driver$first\*\? $LABEL"; then
+if [ -n "$first" ] && ! grep -q "^Driver$first\*\? $LABEL" < <(efibootmgr -r 2>/dev/null); then
   echo "The first driver entry (Driver$first) isn't bt-kb-dxe's; stopping, since the diagnostics replace it." >&2
   efibootmgr -r >&2
   exit 1

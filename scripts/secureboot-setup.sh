@@ -85,7 +85,7 @@ echo "Before you start:"
 echo "  - Keep a wired USB keyboard at hand for the first boot with Secure Boot on: if"
 echo "    bt-kb-dxe isn't signed with your db key, the firmware refuses it, and the"
 echo "    Bluetooth keyboard does nothing until Linux."
-if [ -z "$dry" ] && lsblk -no FSTYPE 2>/dev/null | grep -qi bitlocker; then
+if [ -z "$dry" ] && grep -qi bitlocker < <(lsblk -no FSTYPE 2>/dev/null); then
   echo "  - A BitLocker volume is on this machine: new Secure Boot keys change PCR 7, and"
   echo "    Windows will ask for the recovery key. Have it ready, or suspend BitLocker in"
   echo "    Windows first (manage-bde -protectors -disable C: -RebootCount 2)."
@@ -146,7 +146,7 @@ show info "Enroll the config and rebuild Limine's entries (again after every con
 
 if [ -n "$dry" ]; then signed=info
 elif [ -n "$is_root" ] && command -v sbctl >/dev/null; then
-  if sbctl verify 2>/dev/null | grep -q '✗'; then signed=todo; else signed=done; fi
+  if grep -q '✗' < <(sbctl verify 2>/dev/null); then signed=todo; else signed=done; fi
 else signed=check
 fi
 show "$signed" "Every EFI binary on the ESP signed (sbctl's pacman hook keeps the kernel and Limine signed)" \

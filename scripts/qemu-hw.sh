@@ -49,7 +49,7 @@ fi
 # Decided before anything touches BlueZ or the controller.
 window=""
 if [ -n "${WINDOW:-}" ]; then
-  if ! "$QEMU" -display help 2>/dev/null | grep -qx gtk; then
+  if ! grep -qx gtk < <("$QEMU" -display help 2>/dev/null); then
     echo "This QEMU build has no GTK display; using the terminal instead." >&2
   elif [ -z "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]; then
     echo "No graphical session (WAYLAND_DISPLAY and DISPLAY are unset); using the terminal instead." >&2
@@ -75,8 +75,8 @@ work="$ROOT/qemu/hw"
 mkdir -p "$work"
 started="$(date '+%Y-%m-%d %H:%M:%S')"
 
-bt_powered () { timeout 5 bluetoothctl show 2>/dev/null | grep -q 'Powered: yes'; }
-bt_present () { timeout 5 bluetoothctl list 2>/dev/null | grep -q '^Controller'; }
+bt_powered () { grep -q 'Powered: yes' < <(timeout 5 bluetoothctl show 2>/dev/null); }
+bt_present () { grep -q '^Controller' < <(timeout 5 bluetoothctl list 2>/dev/null); }
 
 restore_bluetooth () {
   local i
