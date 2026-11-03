@@ -28,7 +28,7 @@ use mtk_bt::{FirmwareImage, Mtk};
 use trouble_host::prelude::*;
 use uefi::prelude::*;
 use uefi::println;
-use uefi_bt::app::{args, bring_up_mediatek, hand_off, print_diagnostics, print_pipe_stats, read_file};
+use uefi_bt::app::{args, bring_up_mediatek, first_file_with_suffix, hand_off, print_diagnostics, print_pipe_stats, read_file};
 use uefi_bt::bond::{addr_text, ExportedBond};
 use uefi_bt::hid::{find_keyboard_report, KeyField, KeyboardReport};
 use uefi_bt::embassy::{AclMode, UsbHciTransport};
@@ -38,7 +38,6 @@ mod keys;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_FW: &str = "BT_RAM_CODE_MT7922_1_1_hdr.bin";
-const DEFAULT_BOND: &str = "C00000000001.bond";
 const DEFAULT_SECONDS: u64 = 25;
 const DEFAULT_CONNECT_SECONDS: u64 = 30;
 
@@ -57,7 +56,8 @@ type Pool = DefaultPacketPool;
 struct Options {
     seconds: u64,
     connect_seconds: u64,
-    bond: String,
+    /// `None`: the first *.bond next to the app.
+    bond: Option<String>,
     fw: String,
     allow_upload: bool,
     recover: bool,
@@ -71,7 +71,7 @@ fn usage() {
     println!("usage: bt-kb-probe [options]");
     println!("  -t <seconds>   length of each typing phase, report then boot protocol (default {DEFAULT_SECONDS})");
     println!("  -wait <s>      how long to wait for the keyboard to connect (default {DEFAULT_CONNECT_SECONDS})");
-    println!("  -bond <file>   bond exported by scripts/export-bond.sh (default {DEFAULT_BOND} next to the app)");
+    println!("  -bond <file>   bond exported by scripts/export-bond.sh (default: the first *.bond next to the app)");
     println!("  -fw <file>     firmware file next to the app (default {DEFAULT_FW})");
     println!("  -check         load the bond and firmware files, then stop (touches no hardware)");
     println!("  -upload        allow uploading firmware sections the chip reports missing");
@@ -84,7 +84,7 @@ fn parse_options(args: &[String]) -> Option<Options> {
     let mut o = Options {
         seconds: DEFAULT_SECONDS,
         connect_seconds: DEFAULT_CONNECT_SECONDS,
-        bond: String::from(DEFAULT_BOND),
+        bond: None,
         fw: String::from(DEFAULT_FW),
         allow_upload: false,
         recover: false,
@@ -97,7 +97,7 @@ fn parse_options(args: &[String]) -> Option<Options> {
         match arg.as_str() {
             "-t" => o.seconds = it.next()?.parse().ok()?,
             "-wait" => o.connect_seconds = it.next()?.parse().ok()?,
-            "-bond" => o.bond = it.next()?.clone(),
+            "-bond" => o.bond = Some(it.next()?.clone()),
             "-fw" => o.fw = it.next()?.clone(),
             "-check" => o.check = true,
             "-upload" => o.allow_upload = true,
@@ -462,7 +462,14 @@ fn main() -> Status {
     println!("bt-kb-probe {VERSION}");
     clock::calibrate();
 
-    let bond = match load_bond(&opts.bond) {
+    let bond_name = match opts.bond.clone().map_or_else(|| first_file_with_suffix(".bond"), Ok) {
+        Ok(name) => name,
+        Err(e) => {
+            println!("{e}. Export one with: sudo scripts/export-bond.sh");
+            return Status::NOT_FOUND;
+        }
+    };
+    let bond = match load_bond(&bond_name) {
         Ok(bond) => bond,
         Err(e) => {
             println!("{e}");
