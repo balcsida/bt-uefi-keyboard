@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # Export the BlueZ bond of the Bluetooth keyboard for the UEFI test apps.
 #
-#   sudo scripts/export-bond.sh [C0:00:00:00:00:01]
+#   sudo scripts/export-bond.sh [ADDRESS]
+#
+# ADDRESS is the keyboard's Bluetooth address. It defaults to KEYBOARD_ADDR
+# in private/local.env (not in git: see private/README.md); with neither,
+# the script lists the LE bonds BlueZ has.
 #
 # BlueZ keeps bond keys in a root-only directory, hence sudo. The script
 # writes qemu/keys/<address>.bond, owned by you and readable only by you
@@ -10,10 +14,12 @@
 # this PC. Delete it when you're done:  rm -r qemu/keys
 set -euo pipefail
 
-peer="${1:-C0:00:00:00:00:01}"
-bluez="${BLUEZ_DIR:-/var/lib/bluetooth}"   # BLUEZ_DIR: for testing only
+bluez="${BLUEZ_DIR:-/var/lib/bluetooth}"   # BLUEZ_DIR, KEYS_DIR: for testing only
 root="$(cd "$(dirname "$0")/.." && pwd)"
 owner="${SUDO_USER:-}"
+# Read, not sourced: this runs as root.
+local_addr="$(sed -n 's/^KEYBOARD_ADDR=\([0-9A-Fa-f:]*\)[[:space:]]*$/\1/p' "$root/private/local.env" 2>/dev/null | head -1 || true)"
+peer="$(printf '%s' "${1:-$local_addr}" | tr 'a-f' 'A-F')"
 
 if [ -z "${BLUEZ_DIR:-}" ] && [ "$(id -u)" -ne 0 ]; then
   echo "Run with sudo: BlueZ's key store is readable by root only." >&2
@@ -22,6 +28,20 @@ fi
 if [ -z "$owner" ]; then
   echo "Run it through sudo from your own account, so the file can be given to you." >&2
   exit 1
+fi
+
+if [ -z "$peer" ]; then
+  echo "usage: sudo $0 ADDRESS   (or set KEYBOARD_ADDR in private/local.env)" >&2
+  echo "LE bonds BlueZ has:" >&2
+  for f in "$bluez"/*/*/info; do
+    [ -f "$f" ] && grep -q '^\[LongTermKey\]' "$f" || continue
+    printf '  %s  %s\n' "$(basename "$(dirname "$f")")" "$(sed -n 's/^Name=//p' "$f" | head -1)" >&2
+  done
+  exit 2
+fi
+if ! [[ "$peer" =~ ^([0-9A-F]{2}:){5}[0-9A-F]{2}$ ]]; then
+  echo "Not a Bluetooth address: $peer" >&2
+  exit 2
 fi
 
 info="$(ls -d "$bluez"/*/"$peer"/info 2>/dev/null | head -1 || true)"
@@ -51,7 +71,7 @@ rand="$(ini LongTermKey Rand)"
 irk="$(ini IdentityResolvingKey Key)"
 group="$(id -gn "$owner")"
 
-dir="$root/qemu/keys"
+dir="${KEYS_DIR:-$root/qemu/keys}"
 install -d -m 700 -o "$owner" -g "$group" "$dir"
 out="$dir/$(echo "$peer" | tr -d ':').bond"
 umask 077
