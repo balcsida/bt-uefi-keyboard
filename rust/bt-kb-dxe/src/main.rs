@@ -45,6 +45,7 @@ mod safety;
 mod selftest;
 mod session;
 mod textin;
+mod tpm;
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -256,6 +257,11 @@ fn load() -> Status {
         }
     }
     let image = boot::image_handle();
+    let tpm = tpm::log_state();
+    record::update(|r| {
+        r.tpm_separators = Some(tpm.map(|t| t.separators));
+        false
+    });
 
     if let Ok(text) = app::read_file(SELFTEST_FILE) {
         return selftest::start(text);

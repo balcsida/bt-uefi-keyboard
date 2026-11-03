@@ -4,6 +4,12 @@
 //! and whether a keyboard layout is remembered. `btlog >a file.txt` saves
 //! it to a file.
 //!
+//! With a TPM 2.0 it also sums up the measured boot so far: PCR 7, which
+//! PCRs 0–7 have their separator, and the size of the event log.
+//! `btlog -eventlog FILE` writes the event log itself (crypto-agile
+//! format, as Linux's `binary_bios_measurements`) to FILE on this volume
+//! (a shell-style `fs0:` in front is ignored), for `scripts/eventlog.py`.
+//!
 //! The variables can be written by any OS, so only printable ASCII is
 //! shown; anything else becomes `?`.
 
@@ -17,7 +23,8 @@ use alloc::string::String;
 use uefi::prelude::*;
 use uefi::runtime::{self, VariableVendor};
 use uefi::{cstr16, guid, println, CStr16};
-use uefi_bt as _; // panic handler
+use uefi_bt::eventlog::{self, pcr_list};
+use uefi_bt::{app, tcg};
 
 const VENDOR: VariableVendor = VariableVendor(guid!("5223227b-ac96-454e-9bca-f15199748a3c"));
 const BOOT_LIMIT: u8 = 3;
@@ -34,8 +41,60 @@ fn text(data: &[u8]) -> String {
         .collect()
 }
 
+/// The TPM summary, and with `-eventlog FILE` the event log written out.
+fn tpm(eventlog_file: Option<&str>) -> Status {
+    let Some(mut tcg) = tcg::open() else {
+        println!("TPM: none (no TPM 2.0)");
+        return if eventlog_file.is_some() { Status::NOT_FOUND } else { Status::SUCCESS };
+    };
+    match tcg::read_pcr(&mut tcg, 7) {
+        Ok(value) => println!("TPM: PCR 7 (SHA-256) = {}", tcg::hex(&value)),
+        Err(e) => println!("TPM: reading PCR 7 failed: {e}"),
+    }
+    let log = match tcg::event_log(&mut tcg) {
+        Ok(log) => log,
+        Err(why) => {
+            println!("TPM: no event log: {why}");
+            return if eventlog_file.is_some() { Status::NOT_FOUND } else { Status::SUCCESS };
+        }
+    };
+    if let Some(parsed) = eventlog::parse(log) {
+        println!(
+            "TPM: event log of {} events ({} bytes); separators measured for PCRs {}",
+            parsed.events.len(),
+            log.len(),
+            pcr_list(parsed.separators())
+        );
+    }
+    if let Some(file) = eventlog_file {
+        // Always on btlog's own volume: a shell-style `fs0:` in front is
+        // dropped.
+        let file = match file.split_once(':') {
+            Some((volume, rest)) if !volume.contains('\\') => rest,
+            _ => file,
+        };
+        match app::write_file(file, log) {
+            Ok(()) => println!("TPM: event log written to {file}"),
+            Err(e) => {
+                println!("TPM: writing the event log failed: {e}");
+                return Status::ABORTED;
+            }
+        }
+    }
+    Status::SUCCESS
+}
+
 #[entry]
 fn main() -> Status {
+    let args = app::args();
+    match args.iter().map(String::as_str).collect::<alloc::vec::Vec<_>>().as_slice() {
+        [] => {}
+        ["-eventlog", file] => return tpm(Some(file)),
+        _ => {
+            println!("usage: btlog [-eventlog FILE]");
+            return Status::INVALID_PARAMETER;
+        }
+    }
     match read(cstr16!("BtKbLog")) {
         Some(log) => {
             println!("--- bt-kb-dxe log of this boot (BtKbLog, {} bytes)", log.len());
@@ -57,5 +116,5 @@ fn main() -> Status {
     }
     let layout = if read(cstr16!("BtKbGatt")).is_some() { "yes" } else { "no" };
     println!("Keyboard layout remembered (BtKbGatt): {layout}");
-    Status::SUCCESS
+    tpm(None)
 }

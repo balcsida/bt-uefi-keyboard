@@ -15,6 +15,7 @@ pub mod bond;
 pub mod clock;
 #[cfg(feature = "embassy")]
 pub mod embassy;
+pub mod eventlog;
 pub mod gatt_cache;
 pub mod emergency;
 pub mod hid;
@@ -23,6 +24,8 @@ pub mod link;
 pub mod logbuf;
 pub mod pipe;
 pub mod tap;
+pub mod tcg;
+pub mod tpm2;
 pub mod trace;
 
 use alloc::boxed::Box;

@@ -55,7 +55,10 @@ scripts/qemu-hw-kb.sh [-t 90]      # REAL CONTROLLER: milestone 3, connect to th
 LIVE=1 scripts/qemu-hw-kb.sh       # the same, showing the output in the terminal as it happens
 scripts/qemu-driver-test.sh        # driver, offline: self-test typing, no-device load + second load, panic,
                                    #   ExitBootServices, F2 hotkey at boot (Driver####), boot load without a device,
-                                   #   the board's diagnostics boot on a GPT disk (ONLY="1 7" runs some)
+                                   #   the board's diagnostics boot on a GPT disk, measured boot (TPM=1)
+                                   #   (ONLY="1 7" runs some)
+SB=1 TPM=1 scripts/qemu-driver-test.sh  # the same with Secure Boot on (test keys) and a TPM 2.0 (swtpm)
+scripts/eventlog.py driver FILE    # a TCG event log: where bt-kb-dxe loaded, separators, PCR 7 as it saw it
 scripts/qemu-hw-driver.sh [180]    # REAL CONTROLLER: driver loaded in the shell (QEMU window); end with ebs-test.efi or reset
 scripts/qemu-hw-boot.sh [240]      # REAL CONTROLLER: driver loaded at boot (Driver####, QEMU window, driver log in the
                                    #   terminal); press F2 on the keyboard for the boot menu, try setup, end with Reset.
@@ -124,6 +127,10 @@ out of git:
 - **Live output** (`LIVE=1`): `scripts/live-filter.py` passes the serial console through byte by byte (keys echo as typed, setup screens render) and drops only OVMF's terminal-resize request. Keys typed in the host terminal before QEMU starts are flushed, so they can't reach the guest's serial console.
 - **Window** (`WINDOW=1`, the default in `qemu-hw-driver.sh` and `qemu-hw-boot.sh`): the guest's screen in a GTK window, the driver's log live in the terminal. Keys reach the guest only from the Bluetooth keyboard (no PS/2 controller, serial console to the log file). There's no menu bar or working close button, and Ctrl+C in the terminal is caught: all of these would end QEMU while the driver holds the controller.
 - **Driver at boot:** `add_driver_option` (in `common.sh`) boots the shell once to run `bcfg driver add`, giving a variable store whose Driver#### points at `PciRoot(0x0)/Pci(0x2,0x0)/\bt-kb-dxe.efi`, which is the ESP in every QEMU run here. `-boot menu=on,splash-time=N` gives OVMF a boot countdown with F2/Esc as boot-menu hotkeys.
+- **Secure Boot** (`SB=1`, in `qemu-driver-test.sh` and the `qemu-hw-*` scripts): Arch's `OVMF_CODE.secboot.4m.fd` (Secure Boot, SMM, TPM 2.0) on q35 with SMM and a secure flash. The variable store gets throwaway test keys (PK, KEK, db, in `qemu/sb/keys/`) enrolled with `virt-fw-vars`, and Secure Boot on. Every image put on an ESP comes from `qemu/sb/signed/`, signed with the test db key by `sbsign`. Without sbsigntools, the images' Authenticode hashes are enrolled in db instead (`SB_MODE=hash`), which tests the same enforcement. `virt-fw-vars` comes from the `virt-firmware` package or a venv in `tools/venv-fw`.
+- **TPM** (`TPM=1`): swtpm as a TPM 2.0, attached as `tpm-crb` (`TPM_DEVICE=tpm-tis` for TIS), state in the run's `tpm/` directory. `tpm_host_start` in `common.sh` serves the same state over TCP to tpm2-tools on the host (`TPM2TOOLS_TCTI=swtpm:…`), for provisioning between runs. tpm2-tools only ever talk to swtpm here, never to the machine's TPM.
+  - **Hangs:** about one boot in ten with a TPM hangs in the firmware (Nov 3). QEMU's TPM emulation takes ~15 s for one command, and the guest later stalls for good in a delay loop. It happens without the driver too, with `tpm-crb` and `tpm-tis` alike, and with swtpm's state on tmpfs. `qemu-driver-test.sh` retries a TPM boot that times out (at most twice, from the same variable store and TPM state) and says so: `(TPM boot hung, retrying …)`.
+- **Event log:** `btlog -eventlog FILE` writes the firmware's TCG event log (crypto-agile, the format of Linux's `binary_bios_measurements`) to the ESP; `scripts/eventlog.py` reads and replays it.
 - **Self-test keys:** `bt-kb-dxe.selftest` may contain `{f2}`, `{esc}`, `{enter}`, `{tab}`, `{bs}`, arrows (`{up}` …) and `{wait:MS}`.
 
 ## Known risks
@@ -157,6 +164,7 @@ out of git:
 
 | Stage | Protects against | State |
 | --- | --- | --- |
+| 0. Test harness | Nothing by itself: Secure Boot (OVMF with SMM, test keys, signed images) and a TPM 2.0 (swtpm) in the QEMU runs, so the later stages can be tested before they reach the board. The driver logs PCR 7, which separators were already measured and its own load event when it starts, and `btlog -eventlog` saves the event log for `scripts/eventlog.py`. | Done (Nov 3): Secure Boot in sign and hash mode, the TPM with swtpm. QEMU's TPM emulation hangs about one boot in ten, also without the driver; the harness retries those. |
 | 1. The link (`uefi-bt/src/tap.rs`) | **Goal 4:** reports that arrive before encryption are dropped and counted, not replayed once the link is encrypted. **Goal 5:** the driver never pairs; it refuses LE Enable Encryption with any key but the bonded one, and drops Security Manager (SMP) packets both ways. Without that, TrouBLE 0.8 starts a fresh Just Works pairing when the bonded key fails, so a device answering with the keyboard's address could pair and type. | Done (Nov 3); host tests |
 
 - **When keys count:** the tap treats the link as encrypted only after an

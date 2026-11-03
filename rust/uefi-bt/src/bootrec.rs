@@ -45,6 +45,9 @@ pub struct BootRecord {
     /// Hotkey-like keys delivered (F-keys, Esc, Delete), with counts.
     pub hotkeys: Vec<(&'static str, u32)>,
     pub healthy_ms: Option<u64>,
+    /// The TPM at driver start: `Some(None)` no TPM 2.0; `Some(Some(bits))`
+    /// PCRs 0–7 whose EV_SEPARATOR was already measured (bit n: PCR n).
+    pub tpm_separators: Option<Option<u8>>,
     pub os_started_ms: Option<u64>,
     /// When this record was last written.
     pub updated_ms: u64,
@@ -80,6 +83,13 @@ impl BootRecord {
         let _ = write!(s, "loaded {} after reset {origin}", Secs(self.loaded_at_ms));
         if self.links_closed > 0 {
             let _ = write!(s, "; closed {} link(s) left from before", self.links_closed);
+        }
+        match self.tpm_separators {
+            Some(None) => s.push_str("; no TPM"),
+            Some(Some(bits)) => {
+                let _ = write!(s, "; TPM separators before the driver: {}", crate::eventlog::pcr_list(bits));
+            }
+            None => {}
         }
         match (self.ready_ms, &self.failure) {
             (Some(ms), _) => {
@@ -233,6 +243,14 @@ mod tests {
             "loaded 9.49 s after reset by the firmware; ready +0.21 s; keyboard connected 2x, first +0.48 s; 40 key reports \
              (3 from before encryption dropped); 5 pairing packets dropped; OS started +24.82 s"
         );
+    }
+
+    #[test]
+    fn tpm_separators() {
+        let mut r = BootRecord { loaded_at_ms: 9492, tpm_separators: Some(Some(0x80)), ..BootRecord::default() };
+        assert!(r.render().starts_with("loaded 9.49 s after reset by the firmware; TPM separators before the driver: 7;"));
+        r.tpm_separators = Some(None);
+        assert!(r.render().contains("; no TPM;"));
     }
 
     #[test]

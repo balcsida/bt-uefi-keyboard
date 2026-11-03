@@ -23,19 +23,32 @@
 # The guest's screen opens in a QEMU window, and this terminal shows the
 # driver's log as it is written. WINDOW= LIVE=1 uses the terminal instead
 # (the serial console: no logo or countdown there).
+#
+# SB=1: Secure Boot on (throwaway test keys, signed images), with its own
+# variable store (qemu/hw-boot/OVMF_VARS.sb.fd). TPM=1: a TPM 2.0 (swtpm),
+# state kept in qemu/hw-boot/tpm. FRESH=1 starts both over.
 set -euo pipefail
 . "$(dirname "$0")/common.sh"
 limit="${1:-240}"
 dir="$ROOT/qemu/hw-boot"
 mkdir -p "$dir"
 vars="$dir/OVMF_VARS.4m.fd"
+if [ -n "${SB:-}" ]; then
+  vars="$dir/OVMF_VARS.sb.fd"
+  sb_prepare
+fi
+if [ -n "${FRESH:-}" ] && [ -d "$dir/tpm" ]; then
+  tpm_stop "$dir/tpm"
+  rm -rf "$dir/tpm"
+fi
+export TPM_DIR="$dir/tpm"
 if ! ls "$ROOT"/qemu/keys/*.bond >/dev/null 2>&1; then
   echo "No exported bond in qemu/keys/. Run: sudo scripts/export-bond.sh" >&2
   exit 1
 fi
 if [ -n "${FRESH:-}" ] || [ ! -f "$vars" ]; then
   echo "Preparing a variable store with a Driver#### option for bt-kb-dxe.efi (no controller involved)..."
-  cp "$OVMF_DIR/OVMF_VARS.4m.fd" "$vars"
+  fresh_vars "$vars"
   add_driver_option "$vars" || { echo "Adding the driver option failed." >&2; rm -f "$vars"; exit 1; }
 fi
 echo "$limit" > "$dir/bt-kb-dxe.timelimit"

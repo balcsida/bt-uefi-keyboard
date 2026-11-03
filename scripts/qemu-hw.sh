@@ -17,6 +17,9 @@
 # START_MESSAGE="..." (shown once the host has let go of the controller).
 # The bt-kb-dxe driver's log (QEMU debug console, port 0x402) ends up in
 # qemu/hw/driver.log.
+# SB=1: Secure Boot on, with throwaway test keys and signed images (see
+# scripts/common.sh; VARS_FILE must then be a Secure Boot store). TPM=1: a
+# TPM 2.0 (swtpm), state in TPM_DIR (default qemu/hw/tpm, kept between runs).
 #
 # Handover: BlueZ first powers the adapter off. That disconnects every
 # device and Linux turns the Bluetooth function off, so no link is live when
@@ -37,6 +40,10 @@ ensure_firmware
 if [ $# -eq 0 ]; then
   echo "usage: $0 '<shell command>' ['<shell command>' ...]" >&2
   exit 2
+fi
+if [ -n "${TPM:-}" ] && ! command -v swtpm >/dev/null; then
+  echo "TPM=1 needs swtpm (package swtpm)." >&2
+  exit 1
 fi
 
 # Decided before anything touches BlueZ or the controller.
@@ -97,8 +104,10 @@ restore_bluetooth () {
 }
 
 tail_pid=""
+tpm_dir="${TPM_DIR:-$work/tpm}"
 cleanup () {
   pkill -f "qemu-system-x86_64 .*${work}/" 2>/dev/null || true
+  [ -z "${TPM:-}" ] || tpm_stop "$tpm_dir"
   [ -z "$tail_pid" ] || kill "$tail_pid" 2>/dev/null || true
   # The exported bond only lives on the scratch ESP while QEMU runs.
   rm -f "$work/esp/"*.bond "$work/esp.img"
@@ -118,6 +127,9 @@ if bt_powered; then
 fi
 trap cleanup EXIT
 
+if [ -n "${SB:-}" ]; then
+  sb_prepare
+fi
 make_esp "$work/esp" "$@"
 for extra in ${EXTRA_ESP_FILES:-}; do
   cp "$extra" "$work/esp/"
@@ -127,11 +139,13 @@ for bond in "$ROOT"/qemu/keys/*.bond; do
   [ -f "$bond" ] && install -m 600 "$bond" "$work/esp/"
 done
 vars="${VARS_FILE:-$work/OVMF_VARS.4m.fd}"
-[ -n "${VARS_FILE:-}" ] || cp "$OVMF_DIR/OVMF_VARS.4m.fd" "$vars"
+[ -n "${VARS_FILE:-}" ] || fresh_vars "$vars"
 make_esp_image "$work/esp" "$work/esp.img"
+tpm_start "$tpm_dir"
 
 echo "Passing $node through to QEMU; Bluetooth on the host is down until it exits."
-machine="q35,accel=kvm"
+qemu_fw "$vars"
+machine="q35,$QEMU_MACHINE"
 display_args=(-nographic -serial mon:stdio)
 if [ -n "$window" ]; then
   # The USB tablet (an absolute pointer) keeps a click in the window from
@@ -140,9 +154,7 @@ if [ -n "$window" ]; then
   display_args=(-display gtk,window-close=off,show-menubar=off -name "bt-kb-dxe: Bluetooth keyboard test"
     -device usb-tablet,bus=xhci.0 -serial file:"$work/serial.log" -monitor none -parallel none)
 fi
-qemu_args=(-machine "$machine" -cpu host -m 1G -no-reboot
-  -drive if=pflash,format=raw,readonly=on,file="$OVMF_DIR/OVMF_CODE.4m.fd"
-  -drive if=pflash,format=raw,file="$vars"
+qemu_args=(-machine "$machine" -cpu host -m 1G -no-reboot "${QEMU_FW[@]}"
   -drive if=none,id=esp,format=raw,file="$work/esp.img" -device virtio-blk-pci,drive=esp
   -device qemu-xhci,id=xhci
   -device usb-host,bus=xhci.0,vendorid=0x0e8d,productid=0x0616

@@ -20,13 +20,19 @@ pub fn args() -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Directory of this image on its volume, e.g. `\` or `\EFI\BtKb\`.
-pub fn image_dir() -> String {
-    let path = boot::open_protocol_exclusive::<LoadedImage>(boot::image_handle())
+/// This image's file on its volume, e.g. `\EFI\btkb\bt-kb-dxe.efi`; empty
+/// if the firmware doesn't say.
+pub fn image_path() -> String {
+    boot::open_protocol_exclusive::<LoadedImage>(boot::image_handle())
         .ok()
         .and_then(|img| img.file_path().and_then(|p| p.to_string16(DisplayOnly(true), AllowShortcuts(false)).ok()))
         .map(|s| String::from(&s))
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+/// Directory of this image on its volume, e.g. `\` or `\EFI\BtKb\`.
+pub fn image_dir() -> String {
+    let path = image_path();
     match path.rfind('\\') {
         Some(at) => String::from(&path[..=at]),
         None => String::from("\\"),
@@ -71,6 +77,19 @@ pub fn read_file(name: &str) -> Result<Vec<u8>, String> {
     let mut fs = FileSystem::new(sfs);
     let path = CString16::try_from(full.as_str()).map_err(|_| String::from("bad path"))?;
     fs.read(PathBuf::from(path)).map_err(|e| match e {
+        uefi::fs::Error::Io(io) => alloc::format!("{full}: {:?}", io.uefi_error.status()),
+        other => alloc::format!("{full}: {other}"),
+    })
+}
+
+/// Write a file on this image's volume (replacing it); relative paths are
+/// relative to the image.
+pub fn write_file(name: &str, data: &[u8]) -> Result<(), String> {
+    let full = if name.starts_with('\\') { String::from(name) } else { image_dir() + name };
+    let sfs = boot::get_image_file_system(boot::image_handle()).map_err(|e| alloc::format!("{e:?}"))?;
+    let mut fs = FileSystem::new(sfs);
+    let path = CString16::try_from(full.as_str()).map_err(|_| String::from("bad path"))?;
+    fs.write(PathBuf::from(path), data).map_err(|e| match e {
         uefi::fs::Error::Io(io) => alloc::format!("{full}: {:?}", io.uefi_error.status()),
         other => alloc::format!("{full}: {other}"),
     })
