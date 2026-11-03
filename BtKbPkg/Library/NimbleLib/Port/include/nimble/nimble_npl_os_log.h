@@ -3,7 +3,7 @@
  * nimble_uefi_vlog(), which filters by level and hands complete lines to the
  * log callback registered with NimbleHostInit().
  *
- * SPDX-License-Identifier: BSD-2-Clause-Patent
+ * SPDX-License-Identifier: MIT OR Apache-2.0
  */
 
 #ifndef _NIMBLE_NPL_OS_LOG_H_

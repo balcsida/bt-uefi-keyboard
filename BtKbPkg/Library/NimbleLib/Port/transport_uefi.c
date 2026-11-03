@@ -3,7 +3,7 @@
  * ACL data go to the UEFI glue's send hooks; events and ACL data from the
  * controller come back through nimble_uefi_deliver_evt/acl.
  *
- * SPDX-License-Identifier: BSD-2-Clause-Patent
+ * SPDX-License-Identifier: MIT OR Apache-2.0
  */
 
 #include <stddef.h>

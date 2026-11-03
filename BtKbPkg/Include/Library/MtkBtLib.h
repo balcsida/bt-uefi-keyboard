@@ -16,7 +16,7 @@
   of EFI_USB_IO_PROTOCOL and inside host-based unit tests.
 
   Copyright (c) 2026, Dávid Balatoni
-  SPDX-License-Identifier: BSD-2-Clause-Patent
+  SPDX-License-Identifier: MIT OR Apache-2.0
 **/
 
 #ifndef MTK_BT_LIB_H_

@@ -14,7 +14,7 @@
                 +16 type, +20 download mode / CRC type, +24 CRC, rest reserved
 
   Copyright (c) 2026, Dávid Balatoni
-  SPDX-License-Identifier: BSD-2-Clause-Patent
+  SPDX-License-Identifier: MIT OR Apache-2.0
 **/
 
 #include <Library/MtkBtLib.h>

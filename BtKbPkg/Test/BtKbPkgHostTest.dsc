@@ -4,7 +4,7 @@
 #  Build:  build -p BtKbPkg/Test/BtKbPkgHostTest.dsc -a X64 -t GCC -b NOOPT
 #  Run:    Build/BtKbPkg/HostTest/NOOPT_GCC/X64/MtkBtLibUnitTestHost [firmware.bin]
 #
-#  SPDX-License-Identifier: BSD-2-Clause-Patent
+#  SPDX-License-Identifier: MIT OR Apache-2.0
 ##
 
 [Defines]

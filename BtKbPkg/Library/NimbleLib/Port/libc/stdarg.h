@@ -1,4 +1,4 @@
-/* Freestanding C library header for NimBLE in UEFI (BtKbPkg). SPDX-License-Identifier: BSD-2-Clause-Patent */
+/* Freestanding C library header for NimBLE in UEFI (BtKbPkg). SPDX-License-Identifier: MIT OR Apache-2.0 */
 #ifndef NIMBLE_UEFI_STDARG_H_
 #define NIMBLE_UEFI_STDARG_H_
 typedef __builtin_va_list  va_list;

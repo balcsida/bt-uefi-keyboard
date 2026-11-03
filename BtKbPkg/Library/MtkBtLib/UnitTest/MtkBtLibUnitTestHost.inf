@@ -1,7 +1,7 @@
 ## @file
 #  Host-based unit tests for MtkBtLib against a simulated MT7922.
 #
-#  SPDX-License-Identifier: BSD-2-Clause-Patent
+#  SPDX-License-Identifier: MIT OR Apache-2.0
 ##
 
 [Defines]

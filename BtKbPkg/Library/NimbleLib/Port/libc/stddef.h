@@ -1,4 +1,4 @@
-/* Freestanding C library header for NimBLE in UEFI (BtKbPkg). SPDX-License-Identifier: BSD-2-Clause-Patent */
+/* Freestanding C library header for NimBLE in UEFI (BtKbPkg). SPDX-License-Identifier: MIT OR Apache-2.0 */
 #ifndef NIMBLE_UEFI_STDDEF_H_
 #define NIMBLE_UEFI_STDDEF_H_
 typedef __SIZE_TYPE__     size_t;

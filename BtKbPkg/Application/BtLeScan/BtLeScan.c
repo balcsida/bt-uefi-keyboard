@@ -5,7 +5,7 @@
   keyboard showed up.
 
   Copyright (c) 2026, Dávid Balatoni
-  SPDX-License-Identifier: BSD-2-Clause-Patent
+  SPDX-License-Identifier: MIT OR Apache-2.0
 **/
 
 #include <Uefi.h>

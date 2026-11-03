@@ -1,4 +1,4 @@
-/* Freestanding C library header for NimBLE in UEFI (BtKbPkg). SPDX-License-Identifier: BSD-2-Clause-Patent */
+/* Freestanding C library header for NimBLE in UEFI (BtKbPkg). SPDX-License-Identifier: MIT OR Apache-2.0 */
 #ifndef NIMBLE_UEFI_STDBOOL_H_
 #define NIMBLE_UEFI_STDBOOL_H_
 #if !defined (__cplusplus) && (!defined (__STDC_VERSION__) || (__STDC_VERSION__ < 202311L))

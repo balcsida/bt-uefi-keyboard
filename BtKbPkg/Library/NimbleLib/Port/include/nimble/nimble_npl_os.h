@@ -7,7 +7,7 @@
  * get, delay) poll the HCI transport while they wait, so command completions
  * can arrive.
  *
- * SPDX-License-Identifier: BSD-2-Clause-Patent
+ * SPDX-License-Identifier: MIT OR Apache-2.0
  */
 
 #ifndef _NIMBLE_NPL_OS_H_

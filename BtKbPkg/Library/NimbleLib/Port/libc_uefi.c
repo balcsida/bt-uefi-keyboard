@@ -3,7 +3,7 @@
   memory and string functions, malloc family, and a printf-style formatter
   with standard C semantics (for NimBLE's log lines and ble_uuid_to_str).
 
-  SPDX-License-Identifier: BSD-2-Clause-Patent
+  SPDX-License-Identifier: MIT OR Apache-2.0
 **/
 
 #include <Uefi.h>

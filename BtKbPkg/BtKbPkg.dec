@@ -1,7 +1,7 @@
 ## @file
 #  Bluetooth keyboard support for UEFI firmware setup.
 #
-#  SPDX-License-Identifier: BSD-2-Clause-Patent
+#  SPDX-License-Identifier: MIT OR Apache-2.0
 ##
 
 [Defines]

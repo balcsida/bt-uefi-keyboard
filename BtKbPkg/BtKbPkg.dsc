@@ -3,7 +3,7 @@
 #
 #  Build:  build -p BtKbPkg/BtKbPkg.dsc -a X64 -t GCC -b DEBUG
 #
-#  SPDX-License-Identifier: BSD-2-Clause-Patent
+#  SPDX-License-Identifier: MIT OR Apache-2.0
 ##
 
 [Defines]

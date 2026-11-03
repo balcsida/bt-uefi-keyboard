@@ -2,7 +2,7 @@
  * Internal interface between the NimBLE UEFI port (plain C, NimBLE headers
  * only) and the EDK2 glue in NimbleHost.c.
  *
- * SPDX-License-Identifier: BSD-2-Clause-Patent
+ * SPDX-License-Identifier: MIT OR Apache-2.0
  */
 
 #ifndef NIMBLE_UEFI_PORT_H_

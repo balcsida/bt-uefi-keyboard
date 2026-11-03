@@ -7,7 +7,7 @@
  * through the pump hook while it waits, which is how a command's Command
  * Complete event reaches the host while the host waits for it.
  *
- * SPDX-License-Identifier: BSD-2-Clause-Patent
+ * SPDX-License-Identifier: MIT OR Apache-2.0
  */
 
 #include <stddef.h>

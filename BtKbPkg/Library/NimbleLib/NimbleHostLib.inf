@@ -4,8 +4,9 @@
 #  NimBLE is built freestanding (-nostdinc) against the small C library in
 #  Port/libc, so no host headers leak into the firmware build.
 #
-#  NimBLE: Apache-2.0 (mynewt-nimble/LICENSE, NOTICE). Port and glue:
-#  SPDX-License-Identifier: BSD-2-Clause-Patent
+#  NimBLE: Apache-2.0 (mynewt-nimble/LICENSE, NOTICE), as is
+#  Port/include/syscfg/syscfg.h, a modified copy of NimBLE's. Port and glue:
+#  SPDX-License-Identifier: MIT OR Apache-2.0
 ##
 
 [Defines]
