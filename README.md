@@ -49,7 +49,8 @@ scripts/build-rust.sh              # host tests + Rust UEFI apps
 scripts/qemu-smoke.sh [app.efi]    # OVMF + UEFI shell, no Bluetooth device
 scripts/qemu-hw-probe.sh           # REAL CONTROLLER: milestone 1 probe
 scripts/qemu-hw-scan.sh [-t 60]    # REAL CONTROLLER: milestone 2 scan (passive)
-sudo scripts/export-bond.sh        # copy the keyboard's bond from BlueZ to qemu/keys/ (user-only)
+sudo scripts/export-bond.sh [ADDR] # copy the keyboard's bond from BlueZ to qemu/keys/ (user-only); ADDR defaults to
+                                   #   KEYBOARD_ADDR in private/local.env, without either it lists BlueZ's LE bonds
 scripts/qemu-hw-kb.sh [-t 90]      # REAL CONTROLLER: milestone 3, connect to the keyboard and show key reports
 LIVE=1 scripts/qemu-hw-kb.sh       # the same, showing the output in the terminal as it happens
 scripts/qemu-driver-test.sh        # driver, offline: self-test typing, no-device load + second load, panic,
@@ -71,6 +72,8 @@ sudo scripts/board-diag.sh         # REAL BOARD: next boot only, a UEFI shell in
                                    #   its log, `linux` saves the log and starts Limine; --collect afterwards copies the
                                    #   results to board/ (--dry-run, --remove)
 scripts/build.sh, scripts/test.sh  # the C/EDK2 reference build and its host tests
+scripts/scrub.py check [--history] # private identifiers in tracked files (or in everything a push publishes);
+                                   #   apply FILE replaces them, install-hooks guards commits (see Private data)
 ```
 
 The hardware scripts pass USB device `0e8d:0616` through to OVMF. They power
@@ -81,6 +84,26 @@ back on. Bluetooth is down on the host while QEMU runs, the keyboard included. T
 No script uploads firmware unless `-upload` is passed explicitly. The exported
 bond is copied onto the scratch ESP only for hardware runs and deleted from it
 afterwards; delete `qemu/keys/` when you no longer need it.
+
+## Private data
+
+Hardware identifiers in this repository are placeholders, among them the
+keyboard's Bluetooth address `C0:00:00:00:00:01`, the controller's
+`02:00:00:00:00:02` and the host name `myhost`. The real values are kept
+out of git:
+
+- **`private/`** (git-ignored): `scrub-map.tsv` lists each real value with
+  its placeholder; `local.env` holds local settings such as the keyboard
+  address for `export-bond.sh`. `private/README.md` explains both.
+- **`scripts/scrub.py`** reads that map. `install-hooks` adds pre-commit and
+  commit-msg hooks that refuse a commit containing a real value, `apply FILE`
+  replaces the values in a file (a design-doc snapshot, say), and
+  `check --history` checks every file and message a push would publish.
+  Without a map, as in a fresh clone, it checks nothing.
+- **No address in the code:** `bt-kb-probe` and `bt-le-scan` take the
+  keyboard from the bond file next to them, as the driver does.
+- **Bonds:** exported keyboard bonds hold the link key and stay in
+  `qemu/keys/`, also git-ignored.
 
 ## Controller wedge (Nov 1)
 
