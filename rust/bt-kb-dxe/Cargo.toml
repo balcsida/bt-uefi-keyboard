@@ -29,3 +29,7 @@ bt-hci = { version = "0.10", default-features = false }
 embassy-futures = "0.1"
 embassy-time = "0.5"
 log = "0.4"
+
+[build-dependencies]
+# The firmware image's SHA-256, pinned at build time (build.rs).
+sha2 = "0.10"

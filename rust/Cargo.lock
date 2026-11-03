@@ -83,6 +83,7 @@ dependencies = [
  "embassy-time",
  "log",
  "mtk-bt",
+ "sha2",
  "trouble-host",
  "uefi",
  "uefi-bt",

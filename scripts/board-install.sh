@@ -13,6 +13,22 @@
 #   - the keyboard's bond from qemu/keys/ (sudo scripts/export-bond.sh). It
 #     holds the keyboard's link key; /boot is readable by root only.
 #
+# Secure Boot (stage 2 of the security hardening; README, Security). The
+# firmware verifies Driver#### images against db itself, so the driver and
+# btlog.efi just need the same kind of signature as the boot loader:
+#   - with sbctl's keys (scripts/secureboot-setup.sh), they are signed with
+#     `sbctl sign -s`, which records them, so sbctl's pacman hook and
+#     `sbctl sign-all` keep re-signing them;
+#   - with a db key kept off this machine, set DB_CERT to its certificate
+#     and DB_KEY to the key: a file (removable media, say) or a PKCS#11 URI
+#     (`pkcs11:...`, a token through sbsign's engine). sbctl doesn't record
+#     these files: it can't re-sign without the key;
+#   - with Secure Boot on, the install stops unless both files verify
+#     against a certificate that is in the firmware's db;
+#   - with Secure Boot off, it installs, with a warning.
+# The firmware image must be the one the driver build pinned (its SHA-256,
+# in bt-kb-dxe.firmware.sha256 next to the build).
+#
 # If the driver misbehaves at boot:
 #   - after 3 starts that neither reach an OS nor run 15 s, it stops loading
 #     itself (the BtKbBoots variable; installing again re-enables it);
@@ -29,6 +45,8 @@ FW_SRC="/usr/lib/firmware/mediatek/$FW_NAME.zst"
 EFIVARS="${EFIVARS:-/sys/firmware/efi/efivars}"
 VENDOR=5223227b-ac96-454e-9bca-f15199748a3c
 GLOBAL=8be4df61-93ca-11d2-aa0d-00e098032b8c
+IMAGE_SECURITY=d719b2cb-3d3a-4596-a3bc-dad00e67656f
+SBCTL_KEYS="${SBCTL_KEYS:-/var/lib/sbctl/keys}"
 
 dry=""
 mode=install
@@ -108,11 +126,61 @@ if [ "$mode" = remove ]; then
 fi
 
 # --- install
+sb_on=""
 sb="$EFIVARS/SecureBoot-$GLOBAL"
 if [ -r "$sb" ] && [ "$(tail -c 1 "$sb" | od -An -tu1 | tr -d ' ')" = 1 ]; then
-  echo "Secure Boot is on: the firmware would refuse the unsigned driver. Stopping." >&2
+  sb_on=1
+fi
+
+# How the files get signed: an off-machine db key, sbctl's, or not at all.
+signer=none
+if [ -n "${DB_KEY:-}" ] || [ -n "${DB_CERT:-}" ]; then
+  if [ -z "${DB_KEY:-}" ] || [ -z "${DB_CERT:-}" ] || [ ! -r "$DB_CERT" ]; then
+    echo "Set both DB_KEY (a key file or a pkcs11: URI) and DB_CERT (a readable certificate)." >&2
+    exit 1
+  fi
+  command -v sbsign >/dev/null || { echo "Signing with DB_KEY needs sbsign (package sbsigntools)." >&2; exit 1; }
+  signer=key
+  cert="$DB_CERT"
+elif command -v sbctl >/dev/null && { [ -f "$SBCTL_KEYS/db/db.key" ] || [ -n "$dry" ]; }; then
+  signer=sbctl
+  cert="$SBCTL_KEYS/db/db.pem"
+fi
+if [ -n "$sb_on" ] && [ "$signer" = none ]; then
+  echo "Secure Boot is on, but there is no key to sign the driver with: the firmware would refuse it." >&2
+  echo "Set up sbctl (scripts/secureboot-setup.sh), or set DB_KEY and DB_CERT. Stopping." >&2
   exit 1
 fi
+
+# sign_to SRC OUT: OUT is SRC signed with the chosen key.
+sign_to () {
+  case "$signer" in
+    sbctl) run sbctl sign -o "$2" "$1" ;;
+    key)
+      if [[ "$DB_KEY" == pkcs11:* ]]; then
+        run sbsign --engine pkcs11 --key "$DB_KEY" --cert "$DB_CERT" --output "$2" "$1"
+      else
+        run sbsign --key "$DB_KEY" --cert "$DB_CERT" --output "$2" "$1"
+      fi
+      ;;
+    none) run cp "$1" "$2" ;;
+  esac
+}
+
+# Whether a certificate is enrolled in the firmware's db (its DER bytes in
+# the db variable's signature lists).
+cert_in_db () {
+  python3 -I - "$1" "$EFIVARS/db-$IMAGE_SECURITY" <<'PY'
+import subprocess, sys
+der = subprocess.run(["openssl", "x509", "-in", sys.argv[1], "-outform", "DER"], capture_output=True, check=True).stdout
+try:
+    db = open(sys.argv[2], "rb").read()
+except OSError:
+    sys.exit(1)
+sys.exit(0 if der and der in db else 1)
+PY
+}
+
 if [ ! -f "$DRIVER" ]; then
   echo "No driver build at $DRIVER. Build it first (as yourself): scripts/build-rust.sh" >&2
   exit 1
@@ -126,16 +194,49 @@ if [ ! -f "$FW_SRC" ]; then
   echo "Firmware image $FW_SRC not found (linux-firmware-mediatek)." >&2
   exit 1
 fi
+pin="$(cat "$(dirname "$DRIVER")/bt-kb-dxe.firmware.sha256" 2>/dev/null || true)"
+if [ "$(zstd -q -d -c "$FW_SRC" | sha256sum | cut -d' ' -f1)" != "$pin" ]; then
+  echo "The driver build pins a different firmware image than $FW_SRC (a linux-firmware update?)." >&2
+  echo "Rebuild first, as yourself: scripts/build-rust.sh" >&2
+  exit 1
+fi
+if [ -n "$sb_on" ] && [ -z "$dry" ] && ! cert_in_db "$cert"; then
+  echo "Secure Boot is on, but $cert isn't in the firmware's db: the firmware would refuse the driver. Stopping." >&2
+  exit 1
+fi
 
 echo "ESP: $esp_src (disk $disk, partition $part), files in $DEST"
 echo "Driver build: $(date -r "$DRIVER" '+%Y-%m-%d %H:%M'), $(stat -c %s "$DRIVER") bytes"
-run mkdir -p "$DEST"
-run cp "$DRIVER" "$DEST/bt-kb-dxe.efi"
-# The diagnostics shell's btlog, if scripts/board-diag.sh put it there:
-# kept in step with the driver's log format.
+# Signed (and checked) in a staging directory first, so a failure leaves
+# the installed files as they were.
+stage="$DEST.new"
+run rm -rf "$stage"
+run mkdir -p "$stage"
 LOG_APP="$(dirname "$DRIVER")/bt-kb-log.efi"
-if [ -f "$LOG_APP" ] && { [ -f "$DEST/btlog.efi" ] || [ -n "$dry" ]; }; then
-  run cp "$LOG_APP" "$DEST/btlog.efi"
+sign_to "$DRIVER" "$stage/bt-kb-dxe.efi"
+sign_to "$LOG_APP" "$stage/btlog.efi"
+if [ "$signer" != none ] && [ -z "$dry" ]; then
+  for f in "$stage/bt-kb-dxe.efi" "$stage/btlog.efi"; do
+    if ! sbverify --cert "$cert" "$f" >/dev/null 2>&1; then
+      echo "$(basename "$f") doesn't verify against $cert after signing. Stopping; nothing installed." >&2
+      rm -rf "$stage"
+      exit 1
+    fi
+  done
+fi
+case "$signer" in
+  sbctl) echo "Signed with sbctl's db key" ;;
+  key) echo "Signed with the db key from DB_KEY ($DB_CERT)" ;;
+  none) echo "WARNING: Secure Boot is off and the driver is unsigned: root can replace it, or the files next to it, and the firmware will run them. See scripts/secureboot-setup.sh." ;;
+esac
+run mkdir -p "$DEST"
+run mv "$stage/bt-kb-dxe.efi" "$DEST/bt-kb-dxe.efi"
+run mv "$stage/btlog.efi" "$DEST/btlog.efi"
+run rmdir "$stage"
+if [ "$signer" = sbctl ]; then
+  # Recorded, so sbctl's pacman hook and `sbctl sign-all` re-sign them.
+  run sbctl sign -s "$DEST/bt-kb-dxe.efi"
+  run sbctl sign -s "$DEST/btlog.efi"
 fi
 if [ -n "$dry" ]; then
   echo "  would run: zstd -q -d -c $FW_SRC > $DEST/$FW_NAME"

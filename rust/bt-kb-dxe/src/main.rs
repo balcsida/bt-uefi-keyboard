@@ -89,6 +89,8 @@ use session::{Ctrl, Pool, Shared};
 use textin::Child;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+// FIRMWARE_SHA256, from build.rs.
+include!(concat!(env!("OUT_DIR"), "/firmware_pin.rs"));
 const FW_FILE: &str = "BT_RAM_CODE_MT7922_1_1_hdr.bin";
 const SELFTEST_FILE: &str = "bt-kb-dxe.selftest";
 const TIME_LIMIT_FILE: &str = "bt-kb-dxe.timelimit";
@@ -274,6 +276,24 @@ fn load() -> Status {
             return Status::NOT_FOUND;
         }
     };
+    // Secure Boot covers this driver, not the files next to it: the image
+    // must be the one the driver was built for, before anything parses it.
+    match FIRMWARE_SHA256 {
+        Some(pin) if uefi_bt::sha256(&fw) == pin => {}
+        Some(_) => {
+            error!(
+                "{FW_FILE} isn't the image this driver was built for (SHA-256 differs): refusing it. After a \
+                 linux-firmware update, rebuild and reinstall the driver"
+            );
+            record::failed(clock::now_ms(), "the firmware image doesn't match the pinned SHA-256");
+            return Status::SECURITY_VIOLATION;
+        }
+        None => {
+            error!("this build pins no firmware image (build it with BT_KB_FIRMWARE set): refusing {FW_FILE}");
+            record::failed(clock::now_ms(), "the build pins no firmware image");
+            return Status::SECURITY_VIOLATION;
+        }
+    }
     let fw: &'static [u8] = Box::leak(fw.into_boxed_slice());
     let fw = match FirmwareImage::parse(fw) {
         Ok(fw) => fw,

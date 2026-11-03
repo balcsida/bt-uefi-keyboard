@@ -43,6 +43,12 @@ use mtk_bt::AclKind;
 use uefi::{Handle, Identify, Status};
 
 pub use pipe::{stop_event_pipes, PipeStats};
+
+/// SHA-256 of `data`.
+pub fn sha256(data: &[u8]) -> [u8; 32] {
+    use sha2::Digest;
+    sha2::Sha256::digest(data).into()
+}
 pub use trace::{Dir, HciStats, Trace};
 use uefi_raw::protocol::usb::io::UsbIoProtocol;
 

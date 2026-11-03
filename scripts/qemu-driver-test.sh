@@ -22,6 +22,13 @@
 #      and which separators were already measured; `btlog -eventlog` saves
 #      the event log, and scripts/eventlog.py, replaying it, must arrive at
 #      the PCR 7 value the driver read.
+#   9. a changed firmware image: one byte of the MT7922 image differs, so it
+#      no longer matches the SHA-256 the driver was built with (build.rs);
+#      the driver refuses it and doesn't start.
+#  10. Secure Boot (needs SB=1): Driver#### points at a tampered copy of the
+#      driver, which the firmware refuses; the boot goes on to the shell. In
+#      sign mode also the unsigned driver, and one signed with a key that
+#      isn't in db.
 # The driver's log (QEMU debug console, port 0x402) is shown after each run.
 # ONLY="1 3" runs just those cases.
 #
@@ -294,5 +301,61 @@ else
   else
     echo "btlog wrote no event log"
   fi
+fi
+fi
+
+if want 9; then
+echo
+echo "##### 9. a changed firmware image is refused (SHA-256 pinned at build time)"
+new_esp fwpin
+cp "$FW_BIN" "$work/fwpin/esp/"
+fw="$work/fwpin/esp/$FW_NAME"
+# One byte in the middle of section 1's data.
+printf '\x5a' | dd of="$fw" bs=1 seek=$(( $(stat -c %s "$fw") / 2 )) conv=notrunc status=none
+fake_bond "$work/fwpin/esp"
+printf '%s\r\n' '@echo -off' 'fs0:' 'echo "=== load bt-kb-dxe.efi"' 'load bt-kb-dxe.efi' 'echo "=== drivers"' 'drivers' \
+  'echo "=== done"' 'reset -s' > "$work/fwpin/esp/startup.nsh"
+run_qemu fwpin
+clean_log "$work/fwpin/serial.log" | sed -n '/^=== load/,/^=== drivers/p' | head -3
+echo "--- driver log"
+cat "$work/fwpin/driver.log"
+if grep -q "isn't the image this driver was built for" "$work/fwpin/driver.log" \
+  && ! clean_log "$work/fwpin/serial.log" | grep -q 'Bluetooth LE keyboard'; then
+  echo "firmware pin: the changed image was refused, the driver didn't stay"
+else
+  echo "firmware pin: NOT REFUSED"
+fi
+fi
+
+if want 10; then
+echo
+echo "##### 10. Secure Boot: a driver db doesn't allow is refused, and the boot goes on"
+if [ -z "${SB:-}" ]; then
+  echo "skipped: needs SB=1"
+else
+  variants="tampered"
+  [ "$(sb_mode)" = sign ] && variants="tampered unsigned other-key"
+  for variant in $variants; do
+    new_esp "sb-$variant"
+    drv="$work/sb-$variant/esp/bt-kb-dxe.efi"
+    case "$variant" in
+      tampered) printf '\x01' | dd of="$drv" bs=1 seek=$(( $(stat -c %s "$drv") - 64 )) conv=notrunc status=none ;;
+      unsigned) cp "$DRIVER" "$drv" ;;
+      other-key) sb_sign "$DRIVER" "$drv" other ;;
+    esac
+    cp "$FW_BIN" "$(img "$RUST_EFI_DIR/ebs-test.efi")" "$work/sb-$variant/esp/"
+    fake_bond "$work/sb-$variant/esp"
+    printf '%s\r\n' '@echo -off' 'fs0:' 'echo "=== shell reached"' 'drivers' 'echo "=== ebs-test.efi"' 'ebs-test.efi' \
+      > "$work/sb-$variant/esp/startup.nsh"
+    fresh_vars "$work/sb-$variant/OVMF_VARS.4m.fd"
+    add_driver_option "$work/sb-$variant/OVMF_VARS.4m.fd" >/dev/null || echo "adding the Driver#### option FAILED"
+    KEEP_VARS=1 run_qemu "sb-$variant"
+    if [ ! -s "$work/sb-$variant/driver.log" ] && clean_log "$work/sb-$variant/serial.log" | grep -q '^=== shell reached' \
+      && ! clean_log "$work/sb-$variant/serial.log" | grep -q 'Bluetooth LE keyboard'; then
+      echo "Secure Boot, $variant driver: refused, boot went on to the shell"
+    else
+      echo "Secure Boot, $variant driver: NOT REFUSED (or the boot stopped)"
+    fi
+  done
 fi
 fi

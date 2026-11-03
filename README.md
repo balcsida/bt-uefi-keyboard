@@ -64,8 +64,11 @@ scripts/qemu-hw-boot.sh [240]      # REAL CONTROLLER: driver loaded at boot (Dri
                                    #   terminal); press F2 on the keyboard for the boot menu, try setup, end with Reset.
                                    #   FRESH=1: new NV store; WINDOW= LIVE=1: serial console in the terminal instead
 scripts/qemu-hw.sh "<cmd>" ...     # REAL CONTROLLER: any shell commands
-sudo scripts/board-install.sh      # REAL BOARD: driver + firmware image + bond to \EFI\btkb\, Driver#### entry
-                                   #   (--dry-run shows the steps, --remove undoes everything)
+sudo scripts/board-install.sh      # REAL BOARD: driver + firmware image + bond to \EFI\btkb\, Driver#### entry; signs the
+                                   #   driver with sbctl's db key, or DB_KEY/DB_CERT (a file or pkcs11: URI); with Secure
+                                   #   Boot on, refuses what doesn't verify (--dry-run shows the steps, --remove undoes it)
+scripts/secureboot-setup.sh        # REAL BOARD: the CachyOS sbctl flow as a checklist: what's done, what to run next;
+                                   #   never enrolls keys or changes anything (--dry-run: just the steps; sudo: more checks)
 scripts/board-log.sh               # REAL BOARD: the driver's log of this boot, a timeline since the CPU reset (driver
                                    #   loaded, keyboard connected, hotkeys, boot loader, OS), this and the previous
                                    #   boot's one-line records (BtKbLastBoot), its variables, Linux's setup; for a
@@ -166,6 +169,7 @@ out of git:
 | --- | --- | --- |
 | 0. Test harness | Nothing by itself: Secure Boot (OVMF with SMM, test keys, signed images) and a TPM 2.0 (swtpm) in the QEMU runs, so the later stages can be tested before they reach the board. The driver logs PCR 7, which separators were already measured and its own load event when it starts, and `btlog -eventlog` saves the event log for `scripts/eventlog.py`. | Done (Nov 3): Secure Boot in sign and hash mode, the TPM with swtpm. QEMU's TPM emulation hangs about one boot in ten, also without the driver; the harness retries those. |
 | 1. The link (`uefi-bt/src/tap.rs`) | **Goal 4:** reports that arrive before encryption are dropped and counted, not replayed once the link is encrypted. **Goal 5:** the driver never pairs; it refuses LE Enable Encryption with any key but the bonded one, and drops Security Manager (SMP) packets both ways. Without that, TrouBLE 0.8 starts a fresh Just Works pairing when the bonded key fails, so a device answering with the keyboard's address could pair and type. | Done (Nov 3); host tests |
+| 2. Secure Boot and the firmware image | **Goal 1**, as far as Secure Boot reaches: with your own keys enrolled (sbctl), the firmware runs bt-kb-dxe only if your db key signed it, and refuses a replaced or tampered driver; the boot goes on without it. The MT7922 firmware image next to the driver, which Secure Boot doesn't cover, must match the SHA-256 the driver was built with, or the driver refuses it before parsing it. | Done offline (Nov 3): the Secure Boot tests pass with signed images (sbsign) and with hashes in db |
 
 - **When keys count:** the tap treats the link as encrypted only after an
   Encryption Change (v1 or v2) with status 0x00 and encryption on. It must
@@ -188,6 +192,41 @@ out of git:
   link is encrypted. An unencrypted LE link has no integrity protection,
   so anyone in radio range can inject into that window. For experiments
   only; the driver logs a warning at every start when built this way.
+
+### Secure Boot (stage 2)
+
+- **Setup:** `scripts/secureboot-setup.sh` walks through the CachyOS wiki's
+  flow and checks each step: `sbctl create-keys`; `sbctl enroll-keys
+  --microsoft --firmware-builtin` (without `--firmware-builtin` on ASUS and
+  Gigabyte boards); Limine with an enrolled config
+  (`ENABLE_ENROLL_LIMINE_CONFIG=yes`, a b2sum on the splash path,
+  `limine-enroll-config`, `limine-update`). It enrolls nothing itself.
+- **The driver:** the firmware checks Driver#### images against db itself,
+  so `board-install.sh` signs `bt-kb-dxe.efi` and `btlog.efi` like the boot
+  loader. With sbctl's keys it uses `sbctl sign -s`, which records the
+  files, so sbctl's hook and `sbctl sign-all` keep re-signing them. With
+  Secure Boot on, it stops if a file doesn't verify, or if the signing
+  certificate isn't in the firmware's db. With Secure Boot off, it
+  installs with a warning.
+- **The firmware image:** Secure Boot doesn't cover files next to the
+  driver. The build pins the MT7922 image's SHA-256 (`BT_KB_FIRMWARE`,
+  set by `build-rust.sh`; `bt-kb-dxe/build.rs`). The driver refuses any
+  other image before parsing it, and so does `board-install.sh`. After a
+  linux-firmware update, rebuild and reinstall. Embedding the image instead
+  would have grown the driver by 517 KB for the same guarantee.
+- **Keys off the machine:** sbctl keeps PK, KEK and db unencrypted in
+  `/var/lib/sbctl/keys`. Root can sign anything with them, and the firmware
+  runs it, so against root (goal 1) they must not stay on the machine.
+  Move them to removable media, or keep db on a PKCS#11 token. Then sign
+  with the key mounted: `DB_KEY=/media/key/db.key DB_CERT=/media/key/db.pem
+  sudo -E scripts/board-install.sh`, or `DB_KEY='pkcs11:…'` for a token,
+  through sbsign's engine.
+  - **The price:** sbctl's pacman hook can't re-sign the kernel and Limine
+    after updates. Until you sign them with the key, the next boot fails
+    Secure Boot.
+  - **Microsoft's keys:** with `--microsoft` enrolled (needed for Windows
+    and for GPU option ROMs), anything Microsoft signed runs too, so goal 1
+    also rests on a current dbx.
 
 ### Residual risks
 
