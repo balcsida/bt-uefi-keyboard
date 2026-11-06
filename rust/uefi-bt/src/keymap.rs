@@ -1,6 +1,8 @@
 //! HID keyboard usages to UEFI keys, with modifiers, lock keys and key
 //! repeat, the way UsbKbDxe does it: US layout, repeat after 500 ms and
 //! then every 20 ms, Ctrl+letter left to the Simple Text Input layer.
+//! Unlike UsbKbDxe, Enter, Esc and the function keys don't repeat (see
+//! [`repeats`]).
 //!
 //! Pure logic, no UEFI calls, so it is tested on the host.
 
@@ -78,6 +80,10 @@ pub mod modifier {
 
 pub const REPEAT_DELAY_MS: u64 = 500;
 pub const REPEAT_RATE_MS: u64 = 20;
+
+/// A repeat that ran this long and ended only with a report that also
+/// pressed another key most likely lost its key's release report.
+pub const LOST_RELEASE_HINT_MS: u64 = 1500;
 
 const USAGE_CAPS_LOCK: u16 = 0x39;
 const USAGE_SCROLL_LOCK: u16 = 0x47;
@@ -248,14 +254,38 @@ pub enum Event {
     Toggles(Toggles),
 }
 
+/// Whether a key repeats while held. Enter, Esc and the function keys
+/// (and Pause) don't: holding them is never useful in firmware, and a
+/// repeat that runs away because the key's release report was lost (Nov 3,
+/// in AMI setup) could confirm a dialog, leave a menu, load the defaults
+/// (F9) or save and exit (F10). A lost release can then only move the
+/// cursor or type.
+pub fn repeats(key: &Key) -> bool {
+    key.unicode != chars::CARRIAGE_RETURN
+        && !matches!(key.scan, scan::F1..=scan::F12 | scan::ESC | scan::F13..=0x73 | scan::PAUSE)
+}
+
+/// The key that repeats.
+#[derive(Clone, Copy, Debug)]
+struct Repeat {
+    usage: u16,
+    /// When it next repeats.
+    next_ms: u64,
+    /// When it was pressed.
+    since_ms: u64,
+}
+
 #[derive(Debug, Default)]
 pub struct KeyboardState {
     held: [u16; MAX_HELD],
     held_len: usize,
     modifiers: u8,
     pub toggles: Toggles,
-    /// The key that repeats and when it next does.
-    repeat: Option<(u16, u64)>,
+    repeat: Option<Repeat>,
+    /// Repeats that ran for [`LOST_RELEASE_HINT_MS`] or longer and ended
+    /// only with a report that also pressed another key: most likely their
+    /// key's release report was lost on the way.
+    pub suspect_lost_releases: u32,
 }
 
 impl KeyboardState {
@@ -276,6 +306,7 @@ impl KeyboardState {
         }
         let modifiers_changed = modifiers != self.modifiers;
         self.modifiers = modifiers;
+        let previous_repeat = self.repeat;
 
         let mut pressed = false;
         for &usage in held.iter().filter(|&&u| u != 0) {
@@ -296,7 +327,9 @@ impl KeyboardState {
                 _ => {
                     if let Some(key) = translate(usage, modifiers, self.toggles) {
                         out(Event::Key { key, modifiers, toggles: self.toggles, repeat: false });
-                        self.repeat = Some((usage, now_ms + REPEAT_DELAY_MS));
+                        // The last key pressed repeats, if it may.
+                        self.repeat =
+                            repeats(&key).then_some(Repeat { usage, next_ms: now_ms + REPEAT_DELAY_MS, since_ms: now_ms });
                         pressed = true;
                     }
                 }
@@ -310,9 +343,14 @@ impl KeyboardState {
                 self.held_len += 1;
             }
         }
-        if let Some((usage, _)) = self.repeat {
-            if !self.is_held(usage) {
+        if let Some(r) = self.repeat {
+            if !self.is_held(r.usage) {
                 self.repeat = None;
+            }
+        }
+        if let Some(r) = previous_repeat {
+            if pressed && !self.is_held(r.usage) && now_ms.saturating_sub(r.since_ms) >= LOST_RELEASE_HINT_MS {
+                self.suspect_lost_releases += 1;
             }
         }
         if modifiers_changed && !pressed {
@@ -322,14 +360,14 @@ impl KeyboardState {
 
     /// Key repeat; call regularly.
     pub fn tick(&mut self, now_ms: u64, out: &mut dyn FnMut(Event)) {
-        let Some((usage, at)) = self.repeat else { return };
-        if now_ms < at {
+        let Some(r) = self.repeat else { return };
+        if now_ms < r.next_ms {
             return;
         }
-        match translate(usage, self.modifiers, self.toggles) {
+        match translate(r.usage, self.modifiers, self.toggles) {
             Some(key) => {
                 out(Event::Key { key, modifiers: self.modifiers, toggles: self.toggles, repeat: true });
-                self.repeat = Some((usage, now_ms + REPEAT_RATE_MS));
+                self.repeat = Some(Repeat { next_ms: now_ms + REPEAT_RATE_MS, ..r });
             }
             None => self.repeat = None,
         }
@@ -443,6 +481,59 @@ mod tests {
         let mut more = Vec::new();
         s.tick(3000, &mut |e| more.push(e));
         assert!(more.is_empty());
+    }
+
+    #[test]
+    fn enter_esc_and_function_keys_dont_repeat() {
+        // Enter, keypad Enter, Esc, F9, F10, Pause.
+        for usage in [0x28u16, 0x58, 0x29, 0x42, 0x43, 0x48] {
+            let mut s = KeyboardState::default();
+            assert_eq!(run(&mut s, 0, &[usage], 0).len(), 1, "usage {usage:#x} gave no key");
+            let mut out = Vec::new();
+            for t in (0..=2000).step_by(10) {
+                s.tick(t, &mut |e| out.push(e));
+            }
+            assert!(out.is_empty(), "usage {usage:#x} repeated");
+        }
+        // Delete, Backspace, Up and a letter still do.
+        for usage in [0x4Cu16, 0x2A, 0x52, 0x04] {
+            let mut s = KeyboardState::default();
+            run(&mut s, 0, &[usage], 0);
+            let mut out = Vec::new();
+            s.tick(600, &mut |e| out.push(e));
+            assert_eq!(out.len(), 1, "usage {usage:#x} didn't repeat");
+        }
+    }
+
+    #[test]
+    fn pressing_a_key_that_doesnt_repeat_stops_the_repeat() {
+        let mut s = KeyboardState::default();
+        run(&mut s, 0, &[0x51], 0); // Down, held
+        run(&mut s, 0, &[0x51, 0x28], 700); // and Enter
+        let mut out = Vec::new();
+        for t in (700..=2000).step_by(10) {
+            s.tick(t, &mut |e| out.push(e));
+        }
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn a_long_repeat_ended_by_another_key_is_counted() {
+        // Down's release report is lost: the next report has Enter alone.
+        let mut s = KeyboardState::default();
+        run(&mut s, 0, &[0x51], 0);
+        run(&mut s, 0, &[0x28], 3000);
+        assert_eq!(s.suspect_lost_releases, 1);
+        // Not counted: an ordinary release, quick changes from one key to
+        // another, and a long hold of a key that doesn't repeat.
+        let mut s = KeyboardState::default();
+        run(&mut s, 0, &[0x51], 0);
+        run(&mut s, 0, &[], 3000);
+        run(&mut s, 0, &[0x52], 3100);
+        run(&mut s, 0, &[0x51], 3300);
+        run(&mut s, 0, &[0x28], 3400);
+        run(&mut s, 0, &[0x51], 8000);
+        assert_eq!(s.suspect_lost_releases, 0);
     }
 
     #[test]

@@ -1137,7 +1137,17 @@ impl Driver {
             self.timing_due = Some("connection setup");
         }
         let shared = self.shared;
+        let suspects = self.keyboard.suspect_lost_releases;
         self.keyboard.report(modifiers, &held, now, &mut |e| deliver(shared, e));
+        if self.keyboard.suspect_lost_releases > suspects {
+            warn!(
+                "a key that had repeated for over {}.{} s stopped only when another key was pressed: its release report \
+                 was probably lost ({} so far)",
+                uefi_bt::keymap::LOST_RELEASE_HINT_MS / 1000,
+                uefi_bt::keymap::LOST_RELEASE_HINT_MS % 1000 / 100,
+                self.keyboard.suspect_lost_releases
+            );
+        }
     }
 
     /// Poll the host stack until it has nothing left to do this tick.
@@ -1200,10 +1210,6 @@ impl Driver {
         // releases): cumulative, and only when there are any.
         if let Some(pipe) = self.hci.try_borrow().ok().map(|hci| hci.acl_pipe_report()).filter(|r| !r.is_empty()) {
             let _ = write!(line, "; ACL pipe so far: {pipe}");
-        }
-        let _ = write!(line, "; {} events", t.events);
-        if let Some(p) = self.hci.try_borrow().ok().and_then(|hci| hci.pipe_stats()) {
-            let _ = write!(line, " (pipe: up to {} bytes waiting, {} overflows, {} errors)", p.max_buffered, p.overflows, p.errors);
         }
         let _ = write!(line, "; {} events", t.events);
         if let Some(p) = self.hci.try_borrow().ok().and_then(|hci| hci.pipe_stats()) {
