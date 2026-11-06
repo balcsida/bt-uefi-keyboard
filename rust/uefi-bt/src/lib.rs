@@ -8,6 +8,7 @@ extern crate alloc;
 
 #[macro_use]
 pub mod output;
+pub mod aclstream;
 pub mod app;
 pub mod att;
 pub mod bootrec;
@@ -274,6 +275,8 @@ pub struct UsbHci {
     pub trace: Trace,
     /// Event ring of the asynchronous event transfer, while it runs.
     ring: Option<Box<pipe::EventRing>>,
+    /// The ACL pipe's bytes that belong to the next packets.
+    acl: aclstream::AclStream,
 }
 
 impl Drop for UsbHci {
@@ -316,6 +319,7 @@ impl UsbHci {
             stats: HciStats::default(),
             trace: Trace::new(),
             ring: None,
+            acl: aclstream::AclStream::default(),
         };
         if let Err(e) = hci.start_event_pipe() {
             crate::say!("Asynchronous event transfer refused ({e:?}); reading events synchronously");
@@ -446,50 +450,94 @@ impl UsbHci {
         Ok(())
     }
 
-    /// Read one ACL packet from bulk IN, reassembled from its header length
-    /// and classified (connection data, MediaTek crash dump, debug log).
-    /// Packets longer than `buf` are read completely, but only the first
-    /// `buf.len()` bytes are kept. `Ok(None)` if nothing arrived within
-    /// `timeout_ms`.
+    /// One bulk IN transfer on the ACL endpoint into `buf`; `Ok(0)` for a
+    /// zero-length packet. Unlike uefi-rs's `sync_bulk_receive`, a transfer
+    /// that timed out still returns what it received: a USB stack may report
+    /// a timeout for a transfer that got its data just as its time ran out
+    /// (EDK2's xHCI driver turns that into a success, other stacks needn't),
+    /// and the 1 ms reads time out about 140 times a second. Such data is
+    /// only taken if it can be ACL data: the rest of a waiting packet, or a
+    /// plausible start.
+    fn bulk_in(&mut self, buf: &mut [u8], timeout_ms: usize) -> Result<usize, UsbError> {
+        let continuing = self.acl.pending() > 0;
+        let endpoint = self.info.bulk_in | 0x80;
+        let protocol = self.raw_protocol().ok_or(CLOSED)?;
+        let mut length = buf.len();
+        let mut status = UsbTransferStatus::default();
+        // SAFETY: the protocol stays open for as long as `self`; the buffer
+        // and the out parameters outlive the call.
+        let result = unsafe {
+            ((*protocol).bulk_transfer)(protocol, endpoint, buf.as_mut_ptr().cast(), &mut length, timeout_ms, &mut status)
+        };
+        if result == Status::SUCCESS {
+            return Ok(length.min(buf.len()));
+        }
+        if result == Status::TIMEOUT && length > 0 && length < buf.len() {
+            if continuing || aclstream::plausible_start(&buf[..length]) {
+                self.stats.acl_timeout_data += 1;
+                return Ok(length);
+            }
+            self.stats.acl_timeout_junk += 1;
+        }
+        Err(UsbError { status: result, usb_status: status.bits() })
+    }
+
+    /// The next ACL packet from bulk IN, whole (see `aclstream`: a transfer
+    /// may hold more than one, and one may span transfers), classified
+    /// (connection data, MediaTek crash dump, debug log). Packets longer
+    /// than `buf` are taken out completely, but only the first `buf.len()`
+    /// bytes are kept. `Ok(None)` if no packet came within `timeout_ms`.
     pub fn read_acl(&mut self, buf: &mut [u8], timeout_ms: u32) -> Result<Option<AclRead>, UsbError> {
-        // Always ask for a whole bulk packet, so a full one can't overflow
-        // the transfer (babble), and copy what fits.
-        let mut scratch = [0u8; BULK_PACKET];
-        let mut header = [0u8; 4];
-        let mut got = 0usize;
-        let mut need = 4usize;
-        while got < need {
-            let wait = if got == 0 { timeout_ms.max(1) } else { 200 };
-            let bulk_in = self.info.bulk_in;
-            let n = match self.usb()?.sync_bulk_receive(bulk_in, &mut scratch, wait as usize) {
-                Ok(n) => n,
-                Err(e) if e.status() == Status::TIMEOUT && got == 0 => return Ok(None),
-                Err(e) => return Err(UsbError::from(e)),
-            };
-            if n == 0 {
-                if got == 0 {
-                    return Ok(None); // a stray zero-length packet
-                }
-                break;
+        // A packet needs a few transfers at most, and the rest of a started
+        // one comes right after its start.
+        for _ in 0..8 {
+            if let Some(len) = self.acl.pop(buf) {
+                return Ok(Some(self.acl_packet(buf, len)));
             }
-            for (i, &b) in scratch[..n].iter().enumerate() {
-                if got + i < header.len() {
-                    header[got + i] = b;
+            // Always ask for a whole bulk packet, so a full one can't
+            // overflow the transfer (babble).
+            let mut scratch = [0u8; BULK_PACKET];
+            let continuing = self.acl.pending() > 0;
+            let wait = if continuing { 200 } else { timeout_ms.max(1) };
+            match self.bulk_in(&mut scratch, wait as usize) {
+                Ok(0) if !continuing => return Ok(None), // a stray zero-length packet
+                Ok(n) => self.acl.push(&scratch[..n]),
+                Err(e) if e.status == Status::TIMEOUT => {
+                    // The rest of a started packet never came.
+                    self.acl.give_up();
+                    return Ok(None);
                 }
-                if got + i < buf.len() {
-                    buf[got + i] = b;
+                Err(e) => {
+                    self.acl.clear();
+                    return Err(e);
                 }
-            }
-            got += n;
-            if got >= 4 {
-                need = 4 + usize::from(u16::from_le_bytes([header[2], header[3]]));
-            }
-            if n < BULK_PACKET && got < need {
-                break; // the device ended the transfer early
             }
         }
+        self.acl.give_up();
+        Ok(None)
+    }
 
-        let stored = got.min(buf.len());
+    /// The ACL pipe's irregularities so far, for the logs ("" if none).
+    pub fn acl_pipe_report(&self) -> String {
+        let s = self.acl.stats;
+        let mut parts: Vec<String> = Vec::new();
+        for (n, what) in [
+            (self.stats.acl_timeout_data, "reads timed out with data (kept)"),
+            (self.stats.acl_timeout_junk, "timed-out reads claimed data that wasn't ACL (ignored)"),
+            (s.shared_transfers, "transfers held more than one packet"),
+            (s.spanning_packets, "packets spanned transfers"),
+            (s.resyncs, "times out of step (bytes dropped)"),
+        ] {
+            if n > 0 {
+                parts.push(alloc::format!("{n} {what}"));
+            }
+        }
+        parts.join(", ")
+    }
+
+    /// Account for, trace and classify one whole packet in `buf`.
+    fn acl_packet(&mut self, buf: &[u8], len: usize) -> AclRead {
+        let stored = len.min(buf.len());
         let kind = mtk_bt::classify_acl(&buf[..stored]);
         self.stats.acl_in += 1;
         match kind {
@@ -512,7 +560,7 @@ impl UsbHci {
                 dump("acl<", &buf[..stored], 24);
             }
         }
-        Ok(Some(AclRead { len: got, stored, kind }))
+        AclRead { len, stored, kind }
     }
 
     /// Read and throw away whatever the controller has queued on the event
@@ -550,6 +598,8 @@ impl UsbHci {
         if self.firmware_crashed() {
             return Err(HciError::FirmwareCrashed);
         }
+        // Whatever started a packet before is no use to the next owner.
+        self.acl.clear();
         Ok(report)
     }
 

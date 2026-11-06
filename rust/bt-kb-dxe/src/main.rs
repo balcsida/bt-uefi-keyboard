@@ -1196,6 +1196,15 @@ impl Driver {
             let _ = write!(line, "; {} ACL sent", sent.saturating_sub(self.acl_sent_logged));
             self.acl_sent_logged = sent;
         }
+        // Reads that would have lost a packet before Nov 3 (lost key
+        // releases): cumulative, and only when there are any.
+        if let Some(pipe) = self.hci.try_borrow().ok().map(|hci| hci.acl_pipe_report()).filter(|r| !r.is_empty()) {
+            let _ = write!(line, "; ACL pipe so far: {pipe}");
+        }
+        let _ = write!(line, "; {} events", t.events);
+        if let Some(p) = self.hci.try_borrow().ok().and_then(|hci| hci.pipe_stats()) {
+            let _ = write!(line, " (pipe: up to {} bytes waiting, {} overflows, {} errors)", p.max_buffered, p.overflows, p.errors);
+        }
         let _ = write!(line, "; {} events", t.events);
         if let Some(p) = self.hci.try_borrow().ok().and_then(|hci| hci.pipe_stats()) {
             let _ = write!(line, " (pipe: up to {} bytes waiting, {} overflows, {} errors)", p.max_buffered, p.overflows, p.errors);

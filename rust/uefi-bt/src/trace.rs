@@ -99,6 +99,11 @@ pub struct HciStats {
     /// ACL packets read and thrown away (draining, or no connections).
     pub acl_discarded: u32,
     pub acl_out: u32,
+    /// ACL reads the USB stack reported as timed out, but with data that
+    /// was taken (see `UsbHci::bulk_in`).
+    pub acl_timeout_data: u32,
+    /// Timed-out ACL reads whose claimed data wasn't ACL (left alone).
+    pub acl_timeout_junk: u32,
     /// Crash dump packets seen: the controller firmware has crashed.
     pub fw_dump_packets: u32,
     pub fw_dump_complete: bool,
@@ -116,6 +121,12 @@ impl HciStats {
         );
         if self.events_malformed > 0 {
             crate::say!("  {} malformed events dropped", self.events_malformed);
+        }
+        if self.acl_timeout_data + self.acl_timeout_junk > 0 {
+            crate::say!(
+                "  ACL reads that timed out with data: {} kept, {} not ACL data (ignored)",
+                self.acl_timeout_data, self.acl_timeout_junk
+            );
         }
         let now = crate::clock::now_ms();
         if let Some((opcode, at)) = self.last_command {
