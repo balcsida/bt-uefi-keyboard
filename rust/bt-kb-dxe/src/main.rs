@@ -482,6 +482,15 @@ fn open_get<P: uefi::proto::ProtocolPointer + ?Sized>(handle: Handle) -> uefi::R
     }
 }
 
+/// Starts that failed at the controller's bring-up during this boot. The
+/// firmware calls Start again on every pass that connects drivers (six
+/// times in a row in OVMF, seen with the emulated controller on Nov 14),
+/// and most reasons don't change within a boot: firmware that isn't
+/// loaded, a bond for another controller. After [`START_ATTEMPTS`] the
+/// driver leaves the controller alone until the next boot.
+static FAILED_STARTS: AtomicU32 = AtomicU32::new(0);
+const START_ATTEMPTS: u32 = 2;
+
 /// A MediaTek Bluetooth HCI interface (cached descriptors only).
 fn is_candidate(handle: Handle) -> bool {
     let Ok(mut usb) = open_get::<UsbIo>(handle) else { return false };
@@ -500,6 +509,9 @@ unsafe extern "efiapi" fn supported(
     };
     if STATE.with(|s| s.is_some()) {
         return Status::UNSUPPORTED; // one keyboard controller at a time
+    }
+    if FAILED_STARTS.load(Ordering::Relaxed) >= START_ATTEMPTS {
+        return Status::UNSUPPORTED; // given up for this boot
     }
     // The driver model's test: can we open it BY_DRIVER?
     // SAFETY: closed again when `usb` drops at the end of this function.
@@ -563,6 +575,9 @@ fn start_driver(controller: Handle, agent: Handle) -> Result<(), Status> {
         record::failed(clock::now_ms(), &e);
         app::hand_off(&mut hci, true);
         hci.close();
+        if FAILED_STARTS.fetch_add(1, Ordering::Relaxed) + 1 >= START_ATTEMPTS {
+            error!("the controller couldn't be started {START_ATTEMPTS} times: leaving it alone until the next boot");
+        }
         return Err(Status::DEVICE_ERROR);
     }
     info!("controller ready in {} ms", clock::now_ms() - started);
