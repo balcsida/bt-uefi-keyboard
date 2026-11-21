@@ -129,6 +129,8 @@ pub struct PairShared {
     /// From the tick: a Pairing Failed went over the pairing link. `true`:
     /// the host stack sent it; the reason as in the packet.
     pub failed: Cell<Option<(bool, u8)>>,
+    /// Advertising reports the scan has brought, for the log.
+    pub heard: Cell<u32>,
 }
 
 impl PairShared {

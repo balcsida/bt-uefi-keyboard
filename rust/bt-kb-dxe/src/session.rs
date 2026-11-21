@@ -6,6 +6,7 @@
 //! which also catches the ones that arrive while this side is still busy.
 
 use alloc::string::String;
+use alloc::vec::Vec;
 use core::cell::Cell;
 use core::convert::Infallible;
 
@@ -47,6 +48,12 @@ pub struct Shared {
     /// The bonded keyboard: its address (least significant byte first)
     /// and whether it is a random one. None before a first pairing.
     pub keyboard: Cell<Option<([u8; 6], bool)>>,
+    /// Data packets from the keyboard passed to the host stack so far
+    /// (its answers): what tells a slow discovery from a stalled one.
+    pub answers: Cell<u32>,
+    /// Key reports before this time (ms on the driver's clock) are what
+    /// the keyboard had kept while its notifications were off: dropped.
+    pub stale_until: Cell<u64>,
     /// Pairing in firmware.
     #[cfg(feature = "pairing")]
     pub pairing: crate::pair::PairShared,
@@ -56,9 +63,29 @@ pub struct Shared {
 /// the controller already reported, before going on without it.
 const HOST_ENCRYPTION_GRACE: Duration = Duration::from_millis(500);
 
-/// How long GATT discovery of the keyboard may take before the connection
-/// is dropped and retried. It takes 2-3 s.
-const DISCOVERY_LIMIT: Duration = Duration::from_secs(10);
+/// How long GATT discovery may go without an answer from the keyboard
+/// before the connection is dropped and retried. Not a limit on the whole
+/// of it: that takes 2-3 s on a fresh connection, but about 15 s once the
+/// keyboard has moved to its slower connection parameters, 5 s in. After a
+/// pairing in firmware it always has: on Nov 21 a limit of 10 s on the
+/// whole cut the real keyboard's first discovery off.
+const DISCOVERY_STALL: Duration = Duration::from_secs(10);
+
+/// Ends when nothing has come from the keyboard for [`DISCOVERY_STALL`].
+async fn stalled(shared: &'static Shared) {
+    let mut seen = shared.answers.get();
+    let mut since = Instant::now();
+    loop {
+        Timer::after(Duration::from_millis(200)).await;
+        let now = shared.answers.get();
+        if now != seen {
+            seen = now;
+            since = Instant::now();
+        } else if since.elapsed() >= DISCOVERY_STALL {
+            return;
+        }
+    }
+}
 
 /// Attribute handles found by discovery (or remembered from an earlier
 /// boot), reused on every reconnect.
@@ -353,28 +380,34 @@ async fn serve(
                 }
             }
             let f = match *found {
-                Some(f) => f,
+                Some(f) => {
+                    notifications_on(&client, f.cccd, shared).await?;
+                    f
+                }
                 None => {
-                    // It takes 2-3 s. A stalled one (Nov 3: about half the
-                    // responses, then none) ends the connection sooner, so
-                    // the keyboard reconnects and tries again.
-                    let f = match with_timeout(DISCOVERY_LIMIT, discover(&client)).await {
-                        Ok(result) => result?,
-                        Err(_) => {
+                    // A stalled one (Nov 3: about half the responses, then
+                    // none) ends the connection, so the keyboard reconnects
+                    // and tries again.
+                    let (f, others) = match select(discover(&client), stalled(shared)).await {
+                        Either::First(result) => result?,
+                        Either::Second(()) => {
                             return Err(alloc::format!(
-                                "discovery got nowhere within {} s (it takes 2-3 s): reconnecting",
-                                DISCOVERY_LIMIT.as_secs()
+                                "discovery stalled: no answer from the keyboard for {} s: reconnecting",
+                                DISCOVERY_STALL.as_secs()
                             ));
                         }
                     };
                     log::info!("keyboard input report at {:#06x}: {:?}", f.layout.input, f.layout.report);
                     shared.layout.set(Some(f.layout));
+                    notifications_on(&client, f.cccd, shared).await?;
+                    subscribe_to_the_rest(&client, &others).await?;
+                    // Remembered only now: a connection lost before this
+                    // point discovers, and subscribes, again.
                     *found = Some(f);
                     crate::cache::store(&f, shared.keyboard.get());
                     f
                 }
             };
-            notifications_on(&client, f.cccd).await?;
             Ok(f)
         };
         let session = async {
@@ -437,22 +470,55 @@ async fn leds(client: &GattClient<'_, Ctrl, Pool, 8>, output: Option<u16>, share
     }
 }
 
+/// Turn the notifications of the keyboard's other input reports on (media
+/// keys and the like), once per bond. The driver has no use for them, but
+/// every OS subscribes to all of them, and a keyboard may take that for
+/// the sign of a working host: the real one asks for the connection
+/// parameters it settles on in the moment its first input report is
+/// subscribed to (seen with Linux, Nov 21). A bond made by an OS has them
+/// on already.
+async fn subscribe_to_the_rest(client: &GattClient<'_, Ctrl, Pool, 8>, cccds: &[u16]) -> Result<(), String> {
+    if !cccds.is_empty() {
+        log::info!("turning the notifications of the keyboard's {} other input reports on, as an OS does", cccds.len());
+    }
+    for &cccd in cccds {
+        match client.write_handle(cccd, &[1, 0]).await {
+            Ok(()) => {}
+            Err(BleHostError::BleHost(Error::Att(e))) => log::warn!("the keyboard refused the write to {cccd:#06x}: {e:?}"),
+            Err(e) => return Err(alloc::format!("turning the other input reports' notifications on failed: {e:?}")),
+        }
+    }
+    Ok(())
+}
+
+/// How long after its notifications were turned on a keyboard's key
+/// reports are taken for kept ones.
+const STALE_KEYS_MS: u64 = 1000;
+
 /// Make sure the keyboard notifies key reports to this host. The keyboard
 /// stores this per bonded host (and Linux already turned it on), so it is
 /// written only if it is off.
-async fn notifications_on(client: &GattClient<'_, Ctrl, Pool, 8>, cccd: u16) -> Result<(), String> {
+async fn notifications_on(client: &GattClient<'_, Ctrl, Pool, 8>, cccd: u16, shared: &Shared) -> Result<(), String> {
     let mut value = [0u8; 2];
     let on = matches!(client.read_handle(cccd, &mut value).await, Ok(2) if value[0] & 1 != 0);
     if !on {
         log::info!("turning keyboard report notifications on");
-        client.write_handle(cccd, &[1, 0]).await.map_err(|e| alloc::format!("turning notifications on failed: {e:?}"))?;
+        // The keyboard keeps what was typed while they were off, and sends
+        // it now: after a pairing, the passkey and its Enter (Nov 21: they
+        // ended the shell's countdown). None of it was meant as typing.
+        shared.stale_until.set(u64::MAX);
+        let written = client.write_handle(cccd, &[1, 0]).await;
+        shared.stale_until.set(uefi_bt::clock::now_ms() + STALE_KEYS_MS);
+        written.map_err(|e| alloc::format!("turning notifications on failed: {e:?}"))?;
     }
     Ok(())
 }
 
 /// HID service: Report Map layout, the keyboard input report and its LED
 /// output report.
-async fn discover(client: &GattClient<'_, Ctrl, Pool, 8>) -> Result<Found, String> {
+/// The keyboard's layout, and the notification switches (CCCDs) of its
+/// other input reports.
+async fn discover(client: &GattClient<'_, Ctrl, Pool, 8>) -> Result<(Found, Vec<u16>), String> {
     let services = client
         .services_by_uuid(&Uuid::new_short(UUID_HID_SERVICE))
         .await
@@ -473,6 +539,7 @@ async fn discover(client: &GattClient<'_, Ctrl, Pool, 8>) -> Result<Found, Strin
         find_keyboard_report(&buf[..len]).ok_or_else(|| String::from("no keyboard input report in the Report Map"))?;
 
     let mut input: Option<(u16, u16, u16)> = None;
+    let mut others = Vec::new();
     let mut output = None;
     for c in chars.iter().filter(|c| c.uuid == Uuid::new_short(UUID_REPORT)) {
         // The Report Reference descriptor: first handle after the value
@@ -485,11 +552,12 @@ async fn discover(client: &GattClient<'_, Ctrl, Pool, 8>) -> Result<Found, Strin
         let same_id = report.report_id.is_none_or(|id| id == value[0]);
         match (value[1], c.cccd_handle) {
             (REPORT_TYPE_INPUT, Some(cccd)) if same_id && input.is_none() => input = Some((c.handle, cccd, reference)),
+            (REPORT_TYPE_INPUT, Some(cccd)) => others.push(cccd),
             (REPORT_TYPE_OUTPUT, _) if same_id && output.is_none() => output = Some(c.handle),
             _ => {}
         }
     }
     let (input, cccd, reference) =
         input.ok_or_else(|| String::from("no notifying Report characteristic for the keyboard input report"))?;
-    Ok(Found { cccd, output, reference, layout: Layout { input, report }, verified: true })
+    Ok((Found { cccd, output, reference, layout: Layout { input, report }, verified: true }, others))
 }

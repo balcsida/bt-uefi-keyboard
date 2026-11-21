@@ -197,6 +197,11 @@ struct Link {
     connected_ms: u64,
     /// The first key report of this connection was decoded.
     keys_flowing: bool,
+    /// When the last one was.
+    last_report_ms: u64,
+    /// Key reports dropped as kept ones (`Shared::stale_until`), not yet
+    /// in the log.
+    stale_dropped: u32,
 }
 
 /// The tick's part in pairing in firmware.
@@ -214,6 +219,9 @@ struct PairingSide {
     /// Data from a pairing link that came before the controller's word
     /// that the link is encrypted (see `hold_acl`).
     held_acl: Vec<Vec<u8>>,
+    /// Advertisers that look like keyboards but weren't taken for one in
+    /// pairing mode, already in the log.
+    passed_over: Vec<[u8; 6]>,
 }
 
 struct Driver {
@@ -862,6 +870,7 @@ fn start_driver(controller: Handle, agent: Handle) -> Result<(), Status> {
                 paired: false,
                 shown: pair::Stage::Off,
                 held_acl: Vec::new(),
+                passed_over: Vec::new(),
             },
             smp_in: SmpFilter::default(),
             link: Link::default(),
@@ -1088,9 +1097,21 @@ impl Driver {
         self.pairing_tick(now);
         let shared = self.shared;
         self.keyboard.tick(now, &mut |e| deliver(shared, e));
+        if self.link.stale_dropped > 0 && now >= shared.stale_until.get() {
+            info!(
+                "dropped {} key reports the keyboard had kept from before its notifications were on (after a pairing: the passkey typed on it)",
+                self.link.stale_dropped
+            );
+            self.link.stale_dropped = 0;
+        }
         // Until the keyboard first connects: a note at 5, 10, 20 and 40 s,
-        // so the log shows how long the wait for a key press was.
-        if !self.ever_connected && self.wait_notes < 4 {
+        // so the log shows how long the wait for a key press was. (Not
+        // while pairing is offered: no key press is waited for then.)
+        #[cfg(feature = "pairing")]
+        let offering = shared.pairing.offered.get() && !shared.pairing.over.get();
+        #[cfg(not(feature = "pairing"))]
+        let offering = false;
+        if !offering && !self.ever_connected && self.wait_notes < 4 {
             let waited = now.saturating_sub(self.started_ms);
             if waited >= 5000 << self.wait_notes {
                 self.wait_notes += 1;
@@ -1225,6 +1246,7 @@ impl Driver {
                             if self.hold_acl(packet) {
                                 continue;
                             }
+                            self.shared.answers.set(self.shared.answers.get().wrapping_add(1));
                             self.inbox.push_acl(packet);
                         }
                     }
@@ -1238,11 +1260,23 @@ impl Driver {
     }
 
     fn tap_event(&mut self, event: &[u8], now: u64) {
+        // LE Connection Update Complete: subevent, status, handle,
+        // interval (1.25 ms), latency, supervision timeout (10 ms).
+        if let [0x3E, _, 0x03, status, _, _, i0, i1, l0, l1, t0, t1] = *event {
+            let interval = u32::from(u16::from_le_bytes([i0, i1])) * 125;
+            info!(
+                "connection parameters now: interval {}.{:02} ms, latency {}, timeout {} ms (status {status:#04x})",
+                interval / 100,
+                interval % 100,
+                u16::from_le_bytes([l0, l1]),
+                u32::from(u16::from_le_bytes([t0, t1])) * 10
+            );
+        }
         let Some(change) = self.tap.on_event(event, self.guard) else { return };
         match change {
             TapEvent::Connected { handle } => {
                 info!("keyboard connected (handle {handle:#06x})");
-                self.link = Link { connected_ms: now, keys_flowing: false };
+                self.link = Link { connected_ms: now, keys_flowing: false, last_report_ms: now, stale_dropped: 0 };
                 self.shared.encrypted.set(None);
                 self.ever_connected = true;
                 record::update(|r| {
@@ -1287,7 +1321,7 @@ impl Driver {
                 info!("pairing: connected to the device (handle {handle:#06x}); pairing packets pass on this link");
                 self.shared.pairing.link_encrypted.set(None);
                 self.shared.pairing.failed.set(None);
-                self.smp_in.pairing_failed = None;
+                self.smp_in.new_pairing();
             }
             #[cfg(feature = "pairing")]
             TapEvent::PairingEncrypted { handle, v2 } => {
@@ -1303,11 +1337,20 @@ impl Driver {
                 self.keyboard.release_all();
             }
             TapEvent::Disconnected { reason, dropped, .. } => {
-                info!("keyboard disconnected (reason {reason:#04x}) after {} key reports", self.reports);
+                // (With the times: what tells an idle timeout from a host
+                // the keyboard gave up on.)
+                info!(
+                    "keyboard disconnected (reason {reason:#04x}) after {} key reports, {} s after it connected, {} s after its last key report",
+                    self.reports,
+                    now.saturating_sub(self.link.connected_ms) / 1000,
+                    now.saturating_sub(self.link.last_report_ms) / 1000
+                );
                 if dropped > 0 {
                     warn!("{dropped} key reports arrived on that connection before it was encrypted, and were dropped");
                 }
                 self.shared.encrypted.set(None);
+                // (A write cut off by the disconnection would leave it set.)
+                self.shared.stale_until.set(0);
                 #[cfg(feature = "pairing")]
                 self.shared.pairing.link_encrypted.set(None);
                 self.keyboard.release_all();
@@ -1341,7 +1384,10 @@ impl Driver {
                 );
             }
         }
-        if !p.over.get() && p.found.borrow_mut().on_event(event, now) {
+        if p.over.get() {
+            return;
+        }
+        if p.found.borrow_mut().on_event(event, now) {
             let found = p.found.borrow();
             if let Some(c) = found.best(now, 0) {
                 info!(
@@ -1349,6 +1395,24 @@ impl Driver {
                     addr_text(&c.addr),
                     if c.random { "random" } else { "public" },
                     c.name.as_deref().map_or_else(|| String::from("a keyboard in pairing mode"), |n| alloc::format!("\"{n}\""))
+                );
+            }
+        }
+        // What looks like a keyboard without being taken for one in pairing
+        // mode gets a line too, once each: on a real keyboard the rule
+        // above is a guess until it has been seen to fit.
+        for report in uefi_bt::adv::reports(event) {
+            p.heard.set(p.heard.get() + 1);
+            let ad = uefi_bt::adv::parse_ad(report.data);
+            let Some(why) = uefi_bt::adv::why_not_pairable(&report, &ad) else { continue };
+            if self.pairing.passed_over.len() < 8 && !self.pairing.passed_over.contains(&report.addr) {
+                self.pairing.passed_over.push(report.addr);
+                info!(
+                    "pairing: heard {} too, which looks like a keyboard, but {why} (advertising type {}, flags {:02x?}, appearance {:04x?})",
+                    addr_text(&report.addr),
+                    report.kind,
+                    ad.flags,
+                    ad.appearance
                 );
             }
         }
@@ -1455,6 +1519,21 @@ impl Driver {
             if new.secure_connections { "LE Secure Connections" } else { "LE legacy pairing" },
             bond.summary()
         );
+        // What the two sides said they can do, and which Security Manager
+        // packets went each way: for telling keyboards apart, no secrets.
+        let features = |f: Option<[u8; 6]>| match f {
+            Some([io, _, auth, size, from_host, from_device]) => alloc::format!(
+                "IO capability {io}, authentication {auth:#04x}, {size}-byte key, keys from the host {from_host:#04x}, from the device {from_device:#04x}"
+            ),
+            None => String::from("nothing"),
+        };
+        let (sent, asked) = self.guard.pairing_sent();
+        info!(
+            "pairing: the host asked for {} (packets sent: {sent:#06x}); the device answered {} (received: {:#06x}; bit n: code n)",
+            features(asked),
+            features(self.smp_in.features),
+            self.smp_in.codes
+        );
         if bondstore::store_paired(&bond) {
             info!("the new bond is stored in a variable the OS can't read; it is used from the next boot on");
         } else {
@@ -1467,7 +1546,7 @@ impl Driver {
         cache::forget();
         shared.encrypted.set(Some(new.handle));
         shared.leds.set(Some(self.keyboard.toggles.led_bits()));
-        self.link = Link { connected_ms: now, keys_flowing: false };
+        self.link = Link { connected_ms: now, keys_flowing: false, last_report_ms: now, stale_dropped: 0 };
         self.ever_connected = true;
         self.pairing.paired = true;
         let outcome = if new.secure_connections { "paired (Secure Connections)" } else { "paired (LE legacy pairing)" };
@@ -1545,6 +1624,10 @@ impl Driver {
     }
 
     fn key_report(&mut self, layout: session::Layout, value: &[u8], now: u64) {
+        if now < self.shared.stale_until.get() {
+            self.link.stale_dropped += 1;
+            return;
+        }
         let Some((modifiers, held)) = layout.report.decode(value) else {
             warn!("key report of {} bytes doesn't match the layout", value.len());
             return;
@@ -1556,6 +1639,7 @@ impl Driver {
             r.first_keys_ms.get_or_insert(now);
             first
         });
+        self.link.last_report_ms = now;
         if !self.link.keys_flowing {
             self.link.keys_flowing = true;
             info!("first key report decoded {} ms after the keyboard connected", now.saturating_sub(self.link.connected_ms));
@@ -1832,7 +1916,7 @@ fn hold_for_pairing() {
         }
         boot::stall(Duration::from_millis(2));
     }
-    info!("pairing: the boot goes on after {} ms", clock::now_ms() - started);
+    info!("pairing: the boot goes on after {} ms ({} advertising reports heard)", clock::now_ms() - started, p.heard.get());
 }
 
 unsafe extern "efiapi" fn before_exit_boot_services(_event: Event, _context: Option<NonNull<c_void>>) {

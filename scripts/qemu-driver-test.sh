@@ -765,8 +765,11 @@ expect encryptions = 1
 expect smp-from-host = 0
 expect unknown-commands = 0
 expect keys-notifying = 1
-wait param-accepted >= 1 10000
-wait connection-updates >= 1 5000
+# Its two parameter requests, each answered under its own identifier (the
+# keyboard takes no other answer, and gives a host up that sends none).
+wait param-accepted >= 2 10000
+wait connection-updates >= 2 5000
+expect param-ignored = 0
 media ea
 wait sent 5000
 # The keyboard goes to sleep. The next keys wake it, and arrive.
@@ -789,10 +792,10 @@ check "typed after the keyboard slept and came back" "grep -qx 'SECOND Line 2!' 
 check "encrypted with the bonded key twice, the host stack agreeing" \
   "[ \$(grep -c 'keyboard link encrypted with the bonded key' $s/driver.log) = 2 ] && [ \$(grep -c 'encryption confirmed by the host stack' $s/driver.log) = 2 ]"
 check "the layout discovered and remembered" "grep -q 'keyboard layout remembered for the next boots' $s/driver.log"
-check "the keyboard's parameter request accepted" \
-  "grep -q 'asked for new connection parameters (interval 25 ms-45 ms, latency 4, timeout 2000 ms): accepted' $s/driver.log"
+check "the keyboard's parameter requests accepted, in a way it takes for an answer" \
+  "grep -q 'asked for new connection parameters (interval 25 ms-45 ms, latency 4, timeout 2000 ms): accepted' $s/driver.log && grep -q 'asked for new connection parameters (interval 15 ms-15 ms, latency 20, timeout 2000 ms): accepted' $s/driver.log && grep -q 'connection parameters now: interval 15.00 ms, latency 20' $s/driver.log"
 check "a media key ignored" "grep -q 'report on handle 0x0016 ignored (not the keyboard report): ea 00' $s/driver.log"
-check "the keyboard's idle disconnect seen" "grep -q 'keyboard disconnected (reason 0x13)' $s/driver.log"
+check "the keyboard's idle disconnect seen" "grep -qE 'keyboard disconnected \(reason 0x13\) after 34 key reports, [0-9]+ s after it connected, [0-9]+ s after its last key report' $s/driver.log"
 check "no report dropped, no command refused, no panic" "! grep -qE 'dropped|refused to send|PANIC' $s/driver.log"
 key_counts emu-session
 emu_verdict emu-session
@@ -1171,9 +1174,15 @@ wait pairings >= 1 20000
 expect pairing-failures = 0
 expect bonded = 1
 expect encrypted
-# The same link is the keyboard's from here on.
+# The same link is the keyboard's from here on. The driver subscribes to
+# all seven input reports, as an OS does.
 wait att-quiet-ms >= 400 20000
 expect keys-notifying = 1
+expect reports-notifying = 7
+# With that, and its first parameter request answered, the keyboard asks
+# for the parameters it settles on.
+wait param-accepted >= 2 20000
+expect param-ignored = 0
 wait-screen 30000 === shell reached
 sleep 500
 type echo PAIRED-AND-TYPED{enter}
@@ -1195,6 +1204,8 @@ check "paired with Secure Connections, the tap agreeing" \
   "grep -q 'pairing: link encrypted with the pairing.s key' $q/1.driver.log && grep -q 'paired with \"Emulated Keyboard\" by passkey (LE Secure Connections)' $q/1.driver.log"
 check "the bond stored where the OS can't read it" "grep -q 'the new bond is stored in a variable the OS can.t read' $q/1.driver.log"
 check "the keyboard typed into the shell on the same link" "grep -qx 'PAIRED-AND-TYPED' $q/serial.txt"
+check "   the passkey typed on it, which it sends as keys once it may, wasn't typed into the PC" \
+  "grep -q 'dropped 14 key reports the keyboard had kept' $q/1.driver.log"
 check "no panic, nothing refused" "! grep -qE 'PANIC|panicked|refused' $q/1.driver.log"
 emu_verdict pair-sc
 echo "--- driver log of the pairing boot"
@@ -1246,13 +1257,21 @@ l="$work/pair-legacy"
 cat > "$l/emu.script" <<'EOF'
 set pairing legacy
 set idle off
+# As the real keyboard after its parameter request, which comes before the
+# passkey is typed: an answer takes about 300 ms (peripheral latency), and
+# the first discovery about 13 s.
+set att-delay 300
 pairing-mode
 wait connected 60000
 read-passkey 20000
 wait pairings >= 1 20000
 expect pairing-failures = 0
 expect bonded = 1
-wait att-quiet-ms >= 400 20000
+wait att-quiet-ms >= 1500 60000
+expect connections = 1
+expect reports-notifying = 7
+wait param-accepted >= 2 20000
+expect param-ignored = 0
 wait-screen 30000 === shell reached
 sleep 500
 type echo LEGACY-PAIRED{enter}
@@ -1268,6 +1287,8 @@ check "a. the build says what it allows, on the screen and in the log" \
   "grep -q 'This build allows LE legacy pairing' $l/screen.txt && grep -q 'built with insecure-legacy-pairing' $l/1.driver.log"
 check "   a legacy keyboard paired by passkey, and typed" \
   "grep -q 'paired with \"Emulated Keyboard\" by passkey (LE legacy pairing)' $l/1.driver.log && grep -qx 'LEGACY-PAIRED' $l/serial.txt"
+check "   its slow discovery (over 10 s) was waited for, on the link the pairing was made on" \
+  "grep -q 'keyboard layout remembered' $l/1.driver.log && ! grep -qE 'reconnecting|keyboard disconnected' $l/1.driver.log"
 emu_verdict pair-legacy
 cat > "$l/emu.script" <<'EOF'
 set idle off
@@ -1362,7 +1383,7 @@ waited="$(sed -n 's/.*pairing: the boot goes on after \([0-9]*\) ms.*/\1/p' "$o/
 check "a. no keyboard in pairing mode: the boot waited its 6 s (${waited:-?} ms) and went on" \
   "grep -q 'No keyboard was paired' $o/screen.txt && [ -n '$waited' ] && [ '${waited:-0}' -ge 6000 ] && [ '${waited:-0}' -lt 10500 ] && grep -q '^=== shell reached' $o/serial.txt"
 check "   a keyboard that isn't in pairing mode was left alone" \
-  "! grep -qE 'says it is a keyboard in pairing mode|PANIC|panicked' $o/driver.log && grep -q 'no keyboard is paired with this PC: nothing more to do at this boot' $o/driver.log"
+  "! grep -qE 'says it is a keyboard in pairing mode|PANIC|panicked' $o/driver.log && grep -q 'no keyboard is paired with this PC: nothing more to do at this boot' $o/driver.log && grep -q 'looks like a keyboard, but it is not in pairing mode' $o/driver.log"
 emu_verdict pair-nobody
 
 # b. A device that pairs without a passkey (Just Works).

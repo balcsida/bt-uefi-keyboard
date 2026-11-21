@@ -131,6 +131,25 @@ pub fn claims_pairable_keyboard(report: &Report<'_>, ad: &AdInfo) -> bool {
     report.kind == ADV_IND && discoverable && keyboard && bondable_address(report.addr_type, &report.addr)
 }
 
+/// Why an advertiser that looks like a keyboard isn't taken for one in
+/// pairing mode. `None` if it is taken, or doesn't look like a keyboard.
+/// For the log: a pairing that never starts shouldn't be a riddle.
+pub fn why_not_pairable(report: &Report<'_>, ad: &AdInfo) -> Option<&'static str> {
+    let looks_like_one = ad.hid || matches!(ad.appearance, Some(APPEARANCE_HID | APPEARANCE_KEYBOARD));
+    if !looks_like_one || report.kind == SCAN_RSP || claims_pairable_keyboard(report, ad) {
+        return None;
+    }
+    Some(if report.kind != ADV_IND {
+        "it takes no connections"
+    } else if !ad.flags.is_some_and(|f| f & (FLAG_LIMITED_DISCOVERABLE | FLAG_GENERAL_DISCOVERABLE) != 0) {
+        "it is not in pairing mode (not discoverable)"
+    } else if !bondable_address(report.addr_type, &report.addr) {
+        "it uses a private address"
+    } else {
+        "it says it is another kind of device"
+    })
+}
+
 /// A keyboard that could be paired with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
@@ -320,6 +339,26 @@ mod tests {
         assert!(!check(ADV_IND, 1, [1, 0, 0, 0, 0, 0x40], &PAIRING_AD));
         assert!(!check(ADV_IND, 1, [1, 0, 0, 0, 0, 0x00], &PAIRING_AD));
         assert!(!check(ADV_IND, 2, KBD, &PAIRING_AD));
+    }
+
+    #[test]
+    fn why_a_keyboard_is_passed_over() {
+        let why = |kind: u8, addr_type: u8, addr: [u8; 6], data: &[u8]| {
+            let e = event(kind, addr_type, addr, data, -50);
+            let r = reports(&e).next().unwrap();
+            why_not_pairable(&r, &parse_ad(r.data))
+        };
+        // One in pairing mode is taken; a thermometer is nobody's business.
+        assert_eq!(why(ADV_IND, 1, KBD, &PAIRING_AD), None);
+        assert_eq!(why(ADV_IND, 1, KBD, &[2, 0x01, 0x06, 3, 0x03, 0x09, 0x18]), None);
+        // A bonded keyboard reconnecting; one behind a private address;
+        // a mouse; a keyboard's beacon; and its scan response says nothing.
+        let bonded = [2, 0x01, 0x04, 3, 0x19, 0xC1, 0x03, 3, 0x03, 0x12, 0x18];
+        assert_eq!(why(ADV_IND, 1, KBD, &bonded), Some("it is not in pairing mode (not discoverable)"));
+        assert_eq!(why(ADV_IND, 1, [1, 0, 0, 0, 0, 0x40], &PAIRING_AD), Some("it uses a private address"));
+        assert_eq!(why(ADV_IND, 1, KBD, &[2, 0x01, 0x05, 3, 0x19, 0xC2, 0x03, 3, 0x03, 0x12, 0x18]), Some("it says it is another kind of device"));
+        assert_eq!(why(3, 1, KBD, &PAIRING_AD), Some("it takes no connections"));
+        assert_eq!(why(SCAN_RSP, 1, KBD, &PAIRING_AD), None);
     }
 
     #[test]

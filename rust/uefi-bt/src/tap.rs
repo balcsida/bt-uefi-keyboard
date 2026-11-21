@@ -167,9 +167,21 @@ pub struct SmpFilter {
     /// The reason of the last Pairing Failed that passed on a pairing
     /// link ([`SmpFilter::pass_on`]).
     pub pairing_failed: Option<u8>,
+    /// What passed on the pairing link, for the log (nothing in it is
+    /// secret): bit n is set for Security Manager code n, and the six
+    /// bytes of the last Pairing Request or Response (IO capability, OOB,
+    /// authentication requirements, key size, keys from the initiator,
+    /// keys from the responder).
+    pub codes: u16,
+    pub features: Option<[u8; 6]>,
 }
 
 impl SmpFilter {
+    /// A pairing link begins: forget what passed on the last one.
+    pub fn new_pairing(&mut self) {
+        (self.pairing_failed, self.codes, self.features) = (None, 0, None);
+    }
+
     /// As [`SmpFilter::pass`], except that everything passes on `pairing`,
     /// the connection a pairing is under way on.
     pub fn pass_on(&mut self, packet: &[u8], pairing: Option<u16>) -> bool {
@@ -178,12 +190,17 @@ impl SmpFilter {
                 if self.dropping.is_some_and(|(h, _)| h == pairing) {
                     self.dropping = None;
                 }
-                // A start fragment with Pairing Failed (code 5) on the
-                // Security Manager's channel: handle, length, L2CAP
-                // length, channel, code, reason.
-                if let [_, flags, _, _, _, _, 0x06, 0x00, 0x05, reason, ..] = *packet {
+                // A start fragment on the Security Manager's channel:
+                // handle, length, L2CAP length, channel, code, parameters.
+                // Pairing Failed (code 5) starts with the reason.
+                if let [_, flags, _, _, _, _, 0x06, 0x00, code, ref parameters @ ..] = *packet {
                     if (flags >> 4) & 0b11 != 0b01 {
-                        self.pairing_failed = Some(reason);
+                        self.codes |= 1 << code.min(15);
+                        match (code, parameters) {
+                            (0x05, &[reason, ..]) => self.pairing_failed = Some(reason),
+                            (0x01 | 0x02, &[a, b, c, d, e, f, ..]) => self.features = Some([a, b, c, d, e, f]),
+                            _ => {}
+                        }
                     }
                 }
                 return true;
@@ -310,7 +327,14 @@ impl LinkGuard {
     pub fn allow_pairing(&self, handle: u16) {
         self.pairing.set(Some(handle));
         self.pairing_start.set(None);
-        self.smp_out.borrow_mut().pairing_failed = None;
+        self.smp_out.borrow_mut().new_pairing();
+    }
+
+    /// What the host stack sent on the pairing link: see
+    /// [`SmpFilter::codes`].
+    pub fn pairing_sent(&self) -> (u16, Option<[u8; 6]>) {
+        let out = self.smp_out.borrow();
+        (out.codes, out.features)
     }
 
     /// The host stack told the device that the pairing failed, with this
@@ -1006,6 +1030,14 @@ mod tests {
         assert!(!f.pass_on(&start, Some(H + 1)));
         assert!(!f.pass_on(&cont, Some(H + 1)));
         assert_eq!(f.dropped, 1);
+        // What passed is noted for the log: the codes, and what a Pairing
+        // Response says the device can do. Never a key or a value.
+        assert_eq!((f.codes, f.features), (1 << 0x0C, None));
+        let response = [0x00, 0x22, 0x0B, 0x00, 0x07, 0x00, 0x06, 0x00, 0x02, 0x02, 0x00, 0x05, 0x10, 0x00, 0x03];
+        assert!(f.pass_on(&response, Some(H)));
+        assert_eq!((f.codes, f.features), (1 << 0x0C | 1 << 2, Some([0x02, 0x00, 0x05, 0x10, 0x00, 0x03])));
+        f.new_pairing();
+        assert_eq!((f.codes, f.features, f.pairing_failed), (0, None, None));
     }
 
     #[test]
