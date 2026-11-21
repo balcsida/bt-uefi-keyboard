@@ -61,7 +61,7 @@ make_esp_image () {
 
 # Strip terminal escapes and blank lines from a QEMU serial log.
 clean_log () {
-  sed -e 's/\x1b\[[0-9;?]*[A-Za-z]//g' -e 's/\r//g' "$1" | grep -vE '^\s*$'
+  sed -e 's/\x1b\[[0-9;?=]*[A-Za-z]//g' -e 's/\r//g' "$1" | grep -vE '^\s*$'
 }
 
 # Add a Driver#### option for bt-kb-dxe.efi (first in DriverOrder) to an

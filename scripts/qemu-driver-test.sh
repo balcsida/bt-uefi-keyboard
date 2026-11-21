@@ -75,6 +75,33 @@
 #      keyboard; a woken one directed at its bonded host, then undirected
 #      with the HID service; one in pairing mode with its name in the scan
 #      response.
+#
+# Pairing in firmware: the driver built with the `pairing` feature (and
+# with `insecure-legacy-pairing`), loaded at boot, with no bond anywhere.
+#  21. a Secure Connections keyboard in pairing mode: the boot waits, the
+#      screen shows a passkey, the keyboard's user types it; the keyboard
+#      then types into the shell on the same link. At the next boot the
+#      bond, kept in a boot-services-only variable, is used like any other.
+#  22. LE legacy pairing, which the real keyboard needs: with the driver
+#      built to allow it, a legacy keyboard pairs by passkey; and so does
+#      an impostor that never saw the passkey, which then types. The
+#      driver built without it refuses both.
+#  23. what isn't paired: nothing, when no keyboard is in pairing mode
+#      (the boot waits, then goes on); a device that pairs without a
+#      passkey (Just Works); one that wants a 7-byte key; one that hands
+#      over no key for later connections; a wrong passkey, after which
+#      the right one of a new try works.
+#  24. a new pairing asked for with bt-kb-dxe.pair, with a bond in place:
+#      nobody pairs, and the old bond works after the wait; a keyboard
+#      pairs, and its bond is the one used from then on.
+#  25. a driver that can pair doesn't pair uninvited: with a bond in
+#      place and no marker, a keyboard in pairing mode at the bonded
+#      address gets no pairing (case 15 b. against this build).
+#  26. the bond handed to the OS: after a pairing, and at the next boot,
+#      the driver publishes it encrypted to the key it was built with;
+#      scripts/bond-handoff.py opens it with the private key (and with no
+#      other), it is the key the keyboard holds, and written into a BlueZ
+#      key store it reads back as the same bond.
 # The driver's log (QEMU debug console, port 0x402) is shown after each run.
 # ONLY="1 3" runs just those cases.
 #
@@ -104,6 +131,26 @@ DRIVER="$RUST_EFI_DIR/bt-kb-dxe.efi"
 # The emulated controller and keyboard of cases 13 and up: a host program.
 (cd "$ROOT/rust" && cargo build --quiet -p bt-emu) || { echo "building bt-emu failed" >&2; exit 1; }
 EMU="$ROOT/rust/target/debug/bt-emu"
+# Cases 21 and up: the driver built to pair in firmware, with Secure
+# Connections only (the `pairing` feature) and with LE legacy pairing too
+# (`insecure-legacy-pairing`). Next to the other test images under their
+# own names, so that SB=1 signs them too; on an ESP they are bt-kb-dxe.efi.
+PAIR_DRIVER="$RUST_EFI_DIR/bt-kb-dxe-pair.efi"
+LEGACY_DRIVER="$RUST_EFI_DIR/bt-kb-dxe-legacy.efi"
+# They hand their bond to the OS under a throwaway key, made once (a new
+# key would mean new builds); its private half is what case 26 opens the
+# hand-off with.
+HANDOFF_KEY="$work/handoff.key"
+if [ -z "${ONLY:-}" ] || grep -qE '(^| )2[1-9]( |$)' <<<"$ONLY"; then
+  [ -f "$HANDOFF_KEY" ] || python3 -I "$ROOT/scripts/bond-handoff.py" keygen "$HANDOFF_KEY" > /dev/null
+  handoff_pub="$(python3 -I "$ROOT/scripts/bond-handoff.py" pubkey "$HANDOFF_KEY")"
+  for kind in pair:pairing legacy:insecure-legacy-pairing; do
+    (cd "$ROOT/rust" && BT_KB_FIRMWARE="$FW_BIN" BT_KB_BOND_DIGESTS="$test_digest" BT_KB_HANDOFF_KEY="$handoff_pub" \
+      cargo build --quiet --release --target x86_64-unknown-uefi --target-dir "$ROOT/rust/target/offline-test-${kind%%:*}" \
+      -p bt-kb-dxe --features "${kind##*:}") || { echo "building the ${kind%%:*} test driver failed" >&2; exit 1; }
+    cp "$ROOT/rust/target/offline-test-${kind%%:*}/x86_64-unknown-uefi/release/bt-kb-dxe.efi" "$RUST_EFI_DIR/bt-kb-dxe-${kind%%:*}.efi"
+  done
+fi
 emu_pid=""
 trap 'pkill -f "qemu-system-x86_64 .*${work}/" 2>/dev/null || true; [ -z "$emu_pid" ] || kill "$emu_pid" 2>/dev/null || true; for d in "$work"/*/tpm; do [ -d "$d" ] && tpm_stop "$d"; done' EXIT
 if [ -n "${SB:-}" ]; then
@@ -113,13 +160,16 @@ fi
 # emu_start DIR SCRIPT: the emulated controller and keyboard for one QEMU
 # run, with the test bond as what the keyboard remembers. Its log is
 # DIR/emu.log. Sets emu_sock (for QEMU's chardev) and emu_pid.
+# EMU_STATE=FILE: where the keyboard keeps its bond from one run to the
+# next (a pairing made in one boot is there at the next).
 emu_start () {
   local i
   emu_sock="$1/emu.sock"
   # A Unix socket's path can't be much longer than 100 bytes.
   [ "${#emu_sock}" -lt 100 ] || emu_sock="$(mktemp -u /tmp/bt-emu.XXXXXX)"
   rm -f "$emu_sock"
-  "$EMU" --socket "$emu_sock" --bond "$work/test.bond" --script "$2" --log "$1/emu.log" --quiet --timeout 170 &
+  "$EMU" --socket "$emu_sock" --bond "$work/test.bond" ${EMU_STATE:+--state "$EMU_STATE"} --script "$2" --screen "$1/serial.log" \
+    --log "$1/emu.log" --quiet --timeout 170 &
   emu_pid=$!
   for i in $(seq 1 50); do
     [ -S "$emu_sock" ] && return 0
@@ -1079,4 +1129,529 @@ check "pairing mode, active scan: its name from the scan response" \
   "grep -q ' 1 devices' $c/scan2.txt && grep -q 'ADV_IND SCAN_RSP  \"Emulated Keyboard\"  HID' $c/scan2.txt && ! grep -q 'ADV_DIRECT_IND' $c/scan2.txt"
 check "both scans ended by themselves, the controller handed back" "grep -q '^=== done' $c/serial.txt && ! grep -qE 'Watchdog|PANIC|panicked' $c/serial.txt"
 emu_verdict emu-scan
+fi
+
+# ----- Pairing in firmware -------------------------------------------------
+
+# pair_esp NAME DRIVER: an ESP that boots to a shell prompt, with DRIVER
+# loaded at boot from a Driver#### option, and no bond. The boot waits 15 s
+# for a keyboard in pairing mode.
+pair_esp () {
+  new_esp "$1"
+  cp "$(img "$2")" "$work/$1/esp/bt-kb-dxe.efi"
+  cp "$FW_BIN" "$work/$1/esp/"
+  echo 15 > "$work/$1/esp/bt-kb-dxe.pairwait"
+  printf '%s\r\n' '@echo -off' 'fs0:' 'echo "=== shell reached"' > "$work/$1/esp/startup.nsh"
+  fresh_vars "$work/$1/OVMF_VARS.4m.fd"
+  add_driver_option "$work/$1/OVMF_VARS.4m.fd" > /dev/null || echo "adding the Driver#### option FAILED"
+  rm -f "$work/$1/emu.state"
+}
+
+# The pairing screen as text: what came before the shell started.
+pair_screen () {
+  clean_log "$work/$1/serial.log" > "$work/$1/serial.txt"
+  sed -n '/Bluetooth keyboard (bt-kb-dxe)/,/UEFI Interactive Shell/p' "$work/$1/serial.txt" | grep -vE '^\s*$|UEFI Interactive Shell' > "$work/$1/screen.txt" || true
+}
+
+if want 21; then
+echo
+echo "##### 21. pairing in firmware: a Secure Connections keyboard, by passkey; the bond at the next boot"
+pair_esp pair-sc "$PAIR_DRIVER"
+q="$work/pair-sc"
+cat > "$q/emu.script" <<'EOF'
+# The keyboard's user has pressed its pairing button. The PC finds it,
+# shows a passkey, and the user types it on the keyboard.
+set pairing sc
+set idle off
+pairing-mode
+wait connected 60000
+wait pairing-requests >= 1 10000
+read-passkey 20000
+wait pairings >= 1 20000
+expect pairing-failures = 0
+expect bonded = 1
+expect encrypted
+# The same link is the keyboard's from here on.
+wait att-quiet-ms >= 400 20000
+expect keys-notifying = 1
+wait-screen 30000 === shell reached
+sleep 500
+type echo PAIRED-AND-TYPED{enter}
+wait sent 5000
+sleep 500
+type reset -s{enter}
+wait sent 5000
+EOF
+KEEP_VARS=1 EMU_STATE="$q/emu.state" EMU_SCRIPT="$q/emu.script" run_qemu pair-sc
+pair_screen pair-sc
+cp "$q/driver.log" "$q/1.driver.log"
+cp "$q/emu.log" "$q/1.emu.log"
+sed 's/^/  | /' "$q/screen.txt" | cut -c1-120 | awk '!seen[$0]++' | grep -v 'BdsDxe' | head -24 || true
+check "the boot waited, and the screen asked for a keyboard in pairing mode" \
+  "grep -q 'No Bluetooth keyboard is paired with this PC yet' $q/screen.txt && grep -q 'the boot waits up to 15 s' $q/1.driver.log"
+check "a passkey was shown, for the keyboard found" "grep -qE 'On \"Emulated Keyboard\", type the passkey [0-9]{6} and press Enter \(within 30 s\)' $q/screen.txt"
+check "   and it isn't in the driver's log" "! grep -qE 'passkey [0-9]{6}' $q/1.driver.log"
+check "paired with Secure Connections, the tap agreeing" \
+  "grep -q 'pairing: link encrypted with the pairing.s key' $q/1.driver.log && grep -q 'paired with \"Emulated Keyboard\" by passkey (LE Secure Connections)' $q/1.driver.log"
+check "the bond stored where the OS can't read it" "grep -q 'the new bond is stored in a variable the OS can.t read' $q/1.driver.log"
+check "the keyboard typed into the shell on the same link" "grep -qx 'PAIRED-AND-TYPED' $q/serial.txt"
+check "no panic, nothing refused" "! grep -qE 'PANIC|panicked|refused' $q/1.driver.log"
+emu_verdict pair-sc
+echo "--- driver log of the pairing boot"
+driver_log pair-sc
+
+# The next boot: the keyboard is bonded, and so is the PC.
+printf '%s\r\n' '@echo -off' 'fs0:' 'echo "=== shell reached"' > "$q/esp/startup.nsh"
+cat > "$q/emu.script" <<'EOF'
+set idle off
+expect bonded = 1
+wait initiating 30000
+wait-screen 30000 === shell reached
+sleep 500
+type echo SECOND-BOOT{enter}
+wait encrypted 10000
+wait sent 20000
+sleep 500
+expect pairing-requests = 0
+type reset -s{enter}
+wait sent 5000
+EOF
+KEEP_VARS=1 EMU_STATE="$q/emu.state" EMU_SCRIPT="$q/emu.script" run_qemu pair-sc
+pair_screen pair-sc
+check "next boot: the bond paired in firmware is used, with no waiting and no screen" \
+  "grep -q 'Secure Connections authenticated key, 16 bytes (paired in firmware)' $q/driver.log && ! grep -q 'the boot waits' $q/driver.log && [ ! -s $q/screen.txt ]"
+check "   the link is encrypted with it, and the keyboard types" \
+  "grep -q 'keyboard link encrypted with the bonded key' $q/driver.log && grep -qx 'SECOND-BOOT' $q/serial.txt"
+emu_verdict pair-sc
+fi
+
+# pair_boot NAME: one boot of a pairing case; the screen and the logs of
+# this boot are kept as NAME/N.* by the caller.
+pair_boot () {
+  KEEP_VARS=1 EMU_STATE="$work/$1/emu.state" EMU_SCRIPT="$work/$1/emu.script" run_qemu "$1"
+  pair_screen "$1"
+}
+
+# The lines of the pairing screen, once each.
+show_screen () {
+  sed 's/^/  | /' "$work/$1/screen.txt" | cut -c1-120 | awk '!seen[$0]++' | grep -v 'BdsDxe' | head -24 || true
+}
+
+if want 22; then
+echo
+echo "##### 22. pairing in firmware: LE legacy pairing, allowed and refused"
+# a. A legacy keyboard, and a driver built to allow legacy pairing.
+pair_esp pair-legacy "$LEGACY_DRIVER"
+l="$work/pair-legacy"
+cat > "$l/emu.script" <<'EOF'
+set pairing legacy
+set idle off
+pairing-mode
+wait connected 60000
+read-passkey 20000
+wait pairings >= 1 20000
+expect pairing-failures = 0
+expect bonded = 1
+wait att-quiet-ms >= 400 20000
+wait-screen 30000 === shell reached
+sleep 500
+type echo LEGACY-PAIRED{enter}
+wait sent 5000
+sleep 500
+type reset -s{enter}
+wait sent 5000
+EOF
+pair_boot pair-legacy
+cp "$l/driver.log" "$l/1.driver.log"
+show_screen pair-legacy
+check "a. the build says what it allows, on the screen and in the log" \
+  "grep -q 'This build allows LE legacy pairing' $l/screen.txt && grep -q 'built with insecure-legacy-pairing' $l/1.driver.log"
+check "   a legacy keyboard paired by passkey, and typed" \
+  "grep -q 'paired with \"Emulated Keyboard\" by passkey (LE legacy pairing)' $l/1.driver.log && grep -qx 'LEGACY-PAIRED' $l/serial.txt"
+emu_verdict pair-legacy
+cat > "$l/emu.script" <<'EOF'
+set idle off
+wait initiating 30000
+wait-screen 30000 === shell reached
+sleep 500
+type echo LEGACY-SECOND-BOOT{enter}
+wait encrypted 10000
+wait sent 20000
+sleep 500
+type reset -s{enter}
+wait sent 5000
+EOF
+pair_boot pair-legacy
+check "   next boot: its bond (EDIV and Rand from the keyboard) is used" \
+  "grep -q 'legacy authenticated key, 16 bytes, with EDIV/Rand (paired in firmware)' $l/driver.log && grep -qx 'LEGACY-SECOND-BOOT' $l/serial.txt"
+emu_verdict pair-legacy
+
+# b. Why it is opt-in: a device that never learns the passkey pairs too.
+pair_esp pair-impostor "$LEGACY_DRIVER"
+i="$work/pair-impostor"
+cat > "$i/emu.script" <<'EOF'
+# Somebody else's device, claiming to be a keyboard in pairing mode. It
+# doesn't read the PC's screen: it works the passkey out.
+set pairing legacy
+set impostor 1
+set idle off
+pairing-mode
+wait connected 60000
+wait pairings >= 1 20000
+wait att-quiet-ms >= 400 20000
+wait-screen 30000 === shell reached
+sleep 500
+type echo TYPED-BY-AN-IMPOSTOR{enter}
+wait sent 5000
+sleep 500
+type reset -s{enter}
+wait sent 5000
+EOF
+pair_boot pair-impostor
+check "b. with legacy pairing allowed, an impostor that never saw the passkey pairs, and types" \
+  "grep -q 'impostor: the passkey is [0-9]\{6\}, worked out' $i/emu.log && grep -q 'by passkey (LE legacy pairing)' $i/driver.log && grep -qx 'TYPED-BY-AN-IMPOSTOR' $i/serial.txt"
+emu_verdict pair-impostor
+
+# c. The same device against the driver built without legacy pairing.
+pair_esp pair-nolegacy "$PAIR_DRIVER"
+n="$work/pair-nolegacy"
+echo 30 > "$n/esp/bt-kb-dxe.pairwait"
+printf '%s\r\n' 'reset -s' >> "$n/esp/startup.nsh"
+cat > "$n/emu.script" <<'EOF'
+set pairing legacy
+set impostor 1
+set idle off
+pairing-mode
+wait pairing-failures >= 3 80000
+expect pairings = 0
+expect encryptions = 0
+wait-screen 40000 === shell reached
+expect pairing-failures = 3
+EOF
+pair_boot pair-nolegacy
+show_screen pair-nolegacy
+check "c. without it: refused on the screen, three times, then the boot goes on" \
+  "grep -q 'failed: it only does LE legacy pairing, which this driver wasn.t built to allow' $n/screen.txt && grep -q '3 attempts failed; not offered again before the next boot' $n/driver.log && grep -q '^=== shell reached' $n/serial.txt"
+check "   nothing paired, no key used, no panic" "! grep -qE 'paired with \"|PANIC|panicked|host stack stopped' $n/driver.log"
+emu_verdict pair-nolegacy
+echo "--- driver log of c."
+driver_log pair-nolegacy | grep -E 'pairing|paired|stopped|PANIC' | cut -c1-200 | head -30
+fi
+
+if want 23; then
+echo
+echo "##### 23. pairing in firmware: what isn't paired"
+# a. Nobody is in pairing mode: the bonded keyboard of another PC wakes up.
+pair_esp pair-nobody "$PAIR_DRIVER"
+o="$work/pair-nobody"
+echo 6 > "$o/esp/bt-kb-dxe.pairwait"
+printf '%s\r\n' 'reset -s' >> "$o/esp/startup.nsh"
+cat > "$o/emu.script" <<'EOF'
+set idle off
+wait scanning 30000
+wake
+sleep 3000
+expect connections = 0
+wait-screen 30000 === shell reached
+expect connections = 0
+expect pairing-requests = 0
+EOF
+pair_boot pair-nobody
+show_screen pair-nobody
+waited="$(sed -n 's/.*pairing: the boot goes on after \([0-9]*\) ms.*/\1/p' "$o/driver.log" | tail -1)"
+check "a. no keyboard in pairing mode: the boot waited its 6 s (${waited:-?} ms) and went on" \
+  "grep -q 'No keyboard was paired' $o/screen.txt && [ -n '$waited' ] && [ '${waited:-0}' -ge 6000 ] && [ '${waited:-0}' -lt 10500 ] && grep -q '^=== shell reached' $o/serial.txt"
+check "   a keyboard that isn't in pairing mode was left alone" \
+  "! grep -qE 'says it is a keyboard in pairing mode|PANIC|panicked' $o/driver.log && grep -q 'no keyboard is paired with this PC: nothing more to do at this boot' $o/driver.log"
+emu_verdict pair-nobody
+
+# b. A device that pairs without a passkey (Just Works).
+pair_esp pair-justworks "$PAIR_DRIVER"
+j="$work/pair-justworks"
+printf '%s\r\n' 'reset -s' >> "$j/esp/startup.nsh"
+cat > "$j/emu.script" <<'EOF'
+# It says it has no keys to type a passkey on, so no passkey is asked
+# for: the key exchange goes through, and the PC must not take it. It
+# hangs up each time, before its own keys go out.
+set pairing sc
+set io none
+set idle off
+pairing-mode
+wait pairing-requests >= 3 60000
+wait connected = 0 10000
+expect host-disconnects = 3
+expect encryptions = 3
+expect pairings = 0
+expect bonded = 0
+wait-screen 40000 === shell reached
+EOF
+pair_boot pair-justworks
+show_screen pair-justworks
+check "b. a pairing without the passkey (Just Works) is refused, and nothing stored" \
+  "grep -q 'failed: it paired without the passkey (Just Works)' $j/driver.log && ! grep -qE 'paired with \"|the new bond is stored|PANIC|panicked|host stack stopped' $j/driver.log && grep -q '^=== shell reached' $j/serial.txt"
+emu_verdict pair-justworks
+
+# b2. A key shorter than 128 bits, from a legacy keyboard (the driver built
+#     to allow legacy pairing; the other refuses the keyboard as a whole).
+pair_esp pair-shortkey "$LEGACY_DRIVER"
+k="$work/pair-shortkey"
+printf '%s\r\n' 'reset -s' >> "$k/esp/startup.nsh"
+cat > "$k/emu.script" <<'EOF'
+set pairing legacy
+set key-size 7
+set idle off
+pairing-mode
+wait pairing-requests >= 1 60000
+read-passkey 20000
+wait connected = 0 20000
+# Its user gives up: it answers no further tries.
+set pairing off
+wait-screen 60000 === shell reached
+expect bonded = 0
+expect pairings = 0
+EOF
+pair_boot pair-shortkey
+check "   a keyboard that wants a 7-byte key is refused" \
+  "grep -qE 'failed: (its key is 7 bytes, not 16|the two sides don.t agree on a key of 128 bits)' $k/driver.log && ! grep -qE 'paired with \"|the new bond is stored|PANIC|panicked|host stack stopped' $k/driver.log"
+emu_verdict pair-shortkey
+
+# b3. A legacy keyboard that hands over no key of its own: the pairing ends
+#     with the short-term key only, which is good for one connection.
+pair_esp pair-nokey "$LEGACY_DRIVER"
+y="$work/pair-nokey"
+printf '%s\r\n' 'reset -s' >> "$y/esp/startup.nsh"
+cat > "$y/emu.script" <<'EOF'
+set pairing legacy
+# Its identity only (key distribution bit 0x02), no long-term key (0x01).
+set keys-from-kbd 2
+set idle off
+pairing-mode
+wait pairing-requests >= 1 60000
+read-passkey 20000
+wait connected = 0 20000
+# Its user gives up: it answers no further tries.
+set pairing off
+wait-screen 60000 === shell reached
+expect bonded = 0
+EOF
+pair_boot pair-nokey
+check "   a keyboard that hands over no key for later connections is refused" \
+  "grep -q 'failed: it handed over no key for later connections' $y/driver.log && ! grep -qE 'paired with \"|the new bond is stored|PANIC|panicked|host stack stopped' $y/driver.log"
+emu_verdict pair-nokey
+
+# c. A wrong passkey; the next try has a new one.
+pair_esp pair-wrong "$PAIR_DRIVER"
+w="$work/pair-wrong"
+echo 30 > "$w/esp/bt-kb-dxe.pairwait"
+cat > "$w/emu.script" <<'EOF'
+set pairing sc
+set idle off
+pairing-mode
+wait pairing-requests >= 1 60000
+sleep 300
+# Not what the screen shows (one time in a million it is).
+passkey 000000
+wait pairing-failures >= 1 10000
+wait pairing-requests >= 2 30000
+sleep 500
+read-passkey 20000
+wait pairings >= 1 20000
+wait att-quiet-ms >= 400 20000
+wait-screen 30000 === shell reached
+sleep 500
+type echo SECOND-TRY-PAIRED{enter}
+wait sent 5000
+sleep 500
+type reset -s{enter}
+wait sent 5000
+EOF
+pair_boot pair-wrong
+show_screen pair-wrong
+keys="$(grep -oE 'type the passkey [0-9]{6}' "$w/screen.txt" | awk '!seen[$0]++' | wc -l)"
+check "c. a wrong passkey fails the pairing, and the screen says so" "grep -q 'failed: the passkey typed on it wasn.t the one shown' $w/screen.txt"
+check "   the next try showed another passkey ($keys in all), and paired" \
+  "[ '$keys' = 2 ] && grep -q 'paired with \"Emulated Keyboard\" by passkey (LE Secure Connections)' $w/driver.log && grep -qx 'SECOND-TRY-PAIRED' $w/serial.txt"
+emu_verdict pair-wrong
+fi
+
+if want 24; then
+echo
+echo "##### 24. pairing in firmware: a new pairing asked for (bt-kb-dxe.pair), with a bond in place"
+pair_esp pair-again "$PAIR_DRIVER"
+a="$work/pair-again"
+echo 6 > "$a/esp/bt-kb-dxe.pairwait"
+fake_bond "$a/esp"
+: > "$a/esp/bt-kb-dxe.pair"
+# a. Nobody pairs: the keyboard it had still works, after the wait.
+cat > "$a/emu.script" <<'EOF'
+set idle off
+expect bonded = 1
+wait-screen 40000 === shell reached
+sleep 500
+type echo OLD-BOND-STILL-WORKS{enter}
+wait encrypted 10000
+wait sent 20000
+sleep 500
+expect pairing-requests = 0
+type reset -s{enter}
+wait sent 5000
+EOF
+pair_boot pair-again
+cp "$a/driver.log" "$a/1.driver.log"
+show_screen pair-again
+check "a. the marker asked for a pairing, and the screen said why" \
+  "grep -q 'bt-kb-dxe.pair asked for a new pairing' $a/1.driver.log && grep -q 'A new pairing of the Bluetooth keyboard was asked for' $a/screen.txt"
+check "   nobody paired: the old bond works after the wait" \
+  "grep -q 'pairing: no keyboard was paired in time' $a/1.driver.log && grep -q 'keyboard link encrypted with the bonded key' $a/1.driver.log && grep -qx 'OLD-BOND-STILL-WORKS' $a/serial.txt"
+emu_verdict pair-again
+# The driver deleted the bond file (imported) and the marker; mirror that.
+rm -f "$a/esp/test.bond" "$a/esp/bt-kb-dxe.pair"
+# b. Without the marker: no offer, no waiting.
+cat > "$a/emu.script" <<'EOF'
+set idle off
+wait initiating 30000
+wait-screen 30000 === shell reached
+sleep 500
+type reset -s{enter}
+wait sent 20000
+EOF
+pair_boot pair-again
+check "b. the marker asked once: the next boot doesn't offer pairing" \
+  "! grep -qE 'the boot waits|pairing is offered|asked for a new pairing' $a/driver.log && [ ! -s $a/screen.txt ] && grep -q '(stored)' $a/driver.log"
+emu_verdict pair-again
+# c. Asked again, and this time the keyboard is put into pairing mode.
+: > "$a/esp/bt-kb-dxe.pair"
+echo 20 > "$a/esp/bt-kb-dxe.pairwait"
+cat > "$a/emu.script" <<'EOF'
+set pairing sc
+set idle off
+pairing-mode
+wait connected 60000
+read-passkey 20000
+wait pairings >= 1 20000
+wait att-quiet-ms >= 400 20000
+wait-screen 30000 === shell reached
+sleep 500
+type echo PAIRED-AGAIN{enter}
+wait sent 5000
+sleep 500
+type reset -s{enter}
+wait sent 5000
+EOF
+pair_boot pair-again
+cp "$a/driver.log" "$a/3.driver.log"
+check "c. asked again: the same keyboard, in pairing mode, paired anew and typed" \
+  "grep -q 'paired with \"Emulated Keyboard\" by passkey (LE Secure Connections)' $a/3.driver.log && grep -qx 'PAIRED-AGAIN' $a/serial.txt && ! grep -qE 'PANIC|panicked|refused' $a/3.driver.log"
+emu_verdict pair-again
+rm -f "$a/esp/bt-kb-dxe.pair"
+cat > "$a/emu.script" <<'EOF'
+set idle off
+wait initiating 30000
+wait-screen 30000 === shell reached
+sleep 500
+type echo NEW-BOND-USED{enter}
+wait encrypted 10000
+wait sent 20000
+sleep 500
+type reset -s{enter}
+wait sent 5000
+EOF
+pair_boot pair-again
+check "   from then on the new bond is the one used" \
+  "grep -q 'Secure Connections authenticated key, 16 bytes (paired in firmware)' $a/driver.log && grep -q 'keyboard link encrypted with the bonded key' $a/driver.log && grep -qx 'NEW-BOND-USED' $a/serial.txt"
+emu_verdict pair-again
+fi
+
+if want 25; then
+echo
+echo "##### 25. pairing in firmware: with a bond in place, nobody is paired uninvited"
+pair_esp pair-uninvited "$LEGACY_DRIVER"
+u="$work/pair-uninvited"
+fake_bond "$u/esp"
+printf '%s\r\n' 'stall 12000000' 'reset -s' >> "$u/esp/startup.nsh"
+cat > "$u/emu.script" <<'EOF'
+# The bonded keyboard's address, in pairing mode, without the key: its
+# owner pressed the pairing button, or it is somebody else's device.
+set pairing legacy
+set impostor 1
+set idle off
+pairing-mode
+wait connections >= 2 40000
+expect pairing-requests = 0
+expect smp-from-host = 0
+expect encryptions = 0
+attack-type echo NEVER-TYPED{enter}
+sleep 1000
+expect pairings = 0
+EOF
+pair_boot pair-uninvited
+check "the driver, built to pair (legacy pairing included), had a bond and offered nothing" \
+  "grep -q 'built with' $u/driver.log || ! grep -qE 'pairing is offered|the boot waits|asked for a new pairing' $u/driver.log"
+check "the keyboard without the key: no pairing packet left the PC, nothing was typed" \
+  "grep -q 'the keyboard rejected the stored key' $u/driver.log && ! grep -q 'NEVER-TYPED' $u/serial.txt && ! grep -qE 'paired with \"|PANIC|panicked' $u/driver.log"
+emu_verdict pair-uninvited
+fi
+
+if want 26; then
+echo
+echo "##### 26. pairing in firmware: the bond handed to the OS"
+pair_esp pair-handoff "$LEGACY_DRIVER"
+h="$work/pair-handoff"
+cat > "$h/emu.script" <<'EOF'
+# A legacy keyboard: its bond has an EDIV and a Rand to hand over too.
+set pairing legacy
+set idle off
+pairing-mode
+wait connected 60000
+read-passkey 20000
+wait pairings >= 1 20000
+wait att-quiet-ms >= 400 20000
+wait-screen 30000 === shell reached
+sleep 500
+type reset -s{enter}
+wait sent 5000
+EOF
+pair_boot pair-handoff
+cp "$h/driver.log" "$h/1.driver.log"
+check "at the pairing boot: the new bond is handed over, encrypted to the build's key" \
+  "grep -q 'the bond is handed to the OS, encrypted to the build.s hand-off key (BtKbHandOff, 147 bytes)' $h/1.driver.log"
+emu_verdict pair-handoff
+# The next boot: the shell saves the variable as an OS would find it.
+printf '%s\r\n' '@echo -off' 'fs0:' 'echo "=== variables"' \
+  "dmpstore BtKbHandOff -guid $DIAG_GUID" "dmpstore BtKbHandOff -guid $DIAG_GUID -s handoff.bin" "dmpstore BtKbPaired -guid $DIAG_GUID" \
+  'echo "=== shell reached"' 'reset -s' > "$h/esp/startup.nsh"
+cat > "$h/emu.script" <<'EOF'
+set idle off
+wait-screen 40000 === shell reached
+EOF
+pair_boot pair-handoff
+rm -rf "$h/os"
+mkdir -p "$h/os/bluez/02:00:00:00:00:02" "$h/os/keys"
+mcopy -o -i "$h/esp.img" ::/handoff.bin "$h/os/handoff.bin" 2>/dev/null || true
+check "at the next boot: handed over again; a volatile variable the OS can read, the bond itself staying boot-services only" \
+  "grep -q 'the bond is handed to the OS' $h/driver.log && grep -q \"Variable RT+BS '.*:BtKbHandOff' DataSize = 0x93\" $h/serial.txt && grep -q \"Variable NV+BS '.*:BtKbPaired'\" $h/serial.txt"
+handoff () { python3 -I "$ROOT/scripts/bond-handoff.py" "$@"; }
+opened="$(handoff open "$HANDOFF_KEY" --var "$h/os/handoff.bin" --out "$h/os/got.bond" 2>&1 || true)"
+echo "  $opened" | cut -c1-150
+# What the keyboard holds (bt-emu's state: EDIV, Rand and key in hex).
+check "the private key opens it, and it is the keyboard's key, EDIV and Rand" "python3 -I - '$h/os/got.bond' '$h/emu.state' <<'PY'
+import sys
+bond = dict(l.strip().split('=', 1) for l in open(sys.argv[1]) if '=' in l)
+ediv, rand, ltk = open(sys.argv[2]).read().split()
+ok = (bond['ltk'].lower() == ltk and int(bond['ediv']) == int(ediv, 16) and int(bond['rand']) == int.from_bytes(bytes.fromhex(rand), 'little')
+      and bond['peer'] == 'C0:00:00:00:00:01' and bond['adapter'] == '02:00:00:00:00:02' and bond['ltk_type'] == '1' and int(ediv, 16) != 0)
+sys.exit(0 if ok else 1)
+PY"
+other="$h/os/other.key"
+handoff keygen "$other" > /dev/null
+check "another key doesn't" "! handoff open $other --var $h/os/handoff.bin --out $h/os/other.bond > /dev/null 2>&1 && [ ! -e $h/os/other.bond ]"
+check "the key isn't in the hand-off as it is" "! grep -qiF \"\$(sed -n 's/^ltk=//p' $h/os/got.bond)\" < <(od -An -v -tx1 $h/os/handoff.bin | tr -d ' \n')"
+# Into a BlueZ key store, and back out through the exporter.
+imported="$(handoff import "$HANDOFF_KEY" --var "$h/os/handoff.bin" --bluez "$h/os/bluez" 2>&1 || true)"
+echo "  $imported" | cut -c1-150
+again="$(handoff import "$HANDOFF_KEY" --var "$h/os/handoff.bin" --bluez "$h/os/bluez" 2>&1 || true)"
+BLUEZ_DIR="$h/os/bluez" KEYS_DIR="$h/os/keys" SUDO_USER="$(id -un)" "$ROOT/scripts/export-bond.sh" C0:00:00:00:00:01 > /dev/null 2>&1 || true
+check "written into a BlueZ key store, it reads back as the same bond (and a second import has nothing to do)" \
+  "[ -n \"\$(python3 -I $ROOT/scripts/bond-digest.py $h/os/got.bond 2>/dev/null)\" ] && [ \"\$(python3 -I $ROOT/scripts/bond-digest.py $h/os/got.bond)\" = \"\$(python3 -I $ROOT/scripts/bond-digest.py $h/os/keys/C00000000001.bond 2>/dev/null)\" ] && grep -q 'nothing to do' <<<'$again'"
+check "the files with the key are private" "[ \"\$(stat -c %a $h/os/got.bond $h/os/bluez/02:00:00:00:00:02/C0:00:00:00:00:01/info | sort -u)\" = 600 ]"
 fi
