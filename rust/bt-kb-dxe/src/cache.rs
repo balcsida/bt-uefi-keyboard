@@ -43,11 +43,12 @@ pub fn load(bond: &ExportedBond) -> Option<Found> {
 }
 
 /// Remember a layout; the variable is written only if it changed.
-pub fn store(found: &Found) {
-    let Some(cfg) = crate::config() else { return };
+/// `keyboard`: the bonded keyboard's address and whether it is random.
+pub fn store(found: &Found, keyboard: Option<([u8; 6], bool)>) {
+    let Some((peer, peer_is_random)) = keyboard else { return };
     let record = GattCache {
-        peer: cfg.bond.peer,
-        peer_is_random: cfg.bond.peer_is_random,
+        peer,
+        peer_is_random,
         input: found.layout.input,
         cccd: found.cccd,
         reference: found.reference,

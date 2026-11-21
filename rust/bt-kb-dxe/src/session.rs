@@ -10,6 +10,7 @@ use core::cell::Cell;
 use core::convert::Infallible;
 
 use bt_hci::controller::ExternalController;
+use bt_hci::param::{AddrKind, BdAddr};
 use embassy_futures::select::{select, Either};
 use embassy_time::{with_timeout, Duration, Instant, Timer};
 use trouble_host::prelude::*;
@@ -43,6 +44,12 @@ pub struct Shared {
     /// The connection the controller reported encrypted (the driver's tap
     /// sees every HCI event), whatever the host stack made of the report.
     pub encrypted: Cell<Option<u16>>,
+    /// The bonded keyboard: its address (least significant byte first)
+    /// and whether it is a random one. None before a first pairing.
+    pub keyboard: Cell<Option<([u8; 6], bool)>>,
+    /// Pairing in firmware.
+    #[cfg(feature = "pairing")]
+    pub pairing: crate::pair::PairShared,
 }
 
 /// How long the session trusts the host stack to register an encryption
@@ -68,13 +75,75 @@ pub struct Found {
     pub verified: bool,
 }
 
+/// The address of the bonded keyboard, as the host stack takes it.
+fn keyboard_address(shared: &Shared) -> Option<Address> {
+    let (addr, random) = shared.keyboard.get()?;
+    Some(Address::new(if random { AddrKind::RANDOM } else { AddrKind::PUBLIC }, BdAddr::new(addr)))
+}
+
 /// `remembered`: the layout from an earlier boot, already in `shared`.
-pub async fn run(stack: &'static Stack<'static, Ctrl, Pool>, shared: &'static Shared, keyboard: Address, remembered: Option<Found>) {
+/// The keyboard is the one in `shared`; without one (before a first
+/// pairing) there is only the pairing offer to run, if this boot has one.
+pub async fn run(stack: &'static Stack<'static, Ctrl, Pool>, shared: &'static Shared, remembered: Option<Found>) {
     let mut runner = stack.runner();
-    let central = stack.central();
-    match select(runner.run(), keep_connected(stack, central, shared, keyboard, remembered)).await {
+    #[allow(unused_mut)]
+    let mut central = stack.central();
+    let work = async {
+        #[allow(unused_mut)]
+        let mut found = remembered;
+        #[cfg(feature = "pairing")]
+        if shared.pairing.offered.get() {
+            if let Some(conn) = crate::pair::offer(stack, &mut central, shared).await {
+                // A keyboard nothing is remembered about yet. The link is
+                // encrypted already: the pairing saw to that.
+                found = None;
+                let result = serve(stack, &conn, shared, &mut found).await;
+                finish(conn, &result).await;
+            }
+        }
+        match keyboard_address(shared) {
+            Some(keyboard) => keep_connected(stack, central, shared, keyboard, found).await,
+            None => {
+                log::info!("no keyboard is paired with this PC: nothing more to do at this boot");
+                core::future::pending::<Infallible>().await
+            }
+        }
+    };
+    match select(runner.run(), work).await {
         Either::First(result) => log::error!("host stack stopped: {result:?}"),
         Either::Second(never) => match never {},
+    }
+}
+
+/// The connection parameters the driver asks for.
+pub fn connect_params() -> RequestedConnParams {
+    RequestedConnParams {
+        min_connection_interval: Duration::from_millis(15),
+        max_connection_interval: Duration::from_millis(30),
+        max_latency: 0,
+        min_event_length: Duration::from_secs(0),
+        max_event_length: Duration::from_secs(0),
+        supervision_timeout: Duration::from_secs(4),
+    }
+}
+
+/// A connection's session is over: say why, and make sure the link is
+/// gone before the next one.
+async fn finish(conn: Connection<'static, Pool>, result: &Result<String, String>) {
+    match result {
+        Ok(reason) => log::info!("keyboard disconnected: {reason}"),
+        Err(e) => log::warn!("keyboard session ended: {e}"),
+    }
+    if conn.is_connected() {
+        conn.disconnect();
+        let _ = with_timeout(Duration::from_secs(3), async {
+            loop {
+                if let ConnectionEvent::Disconnected { .. } = conn.next().await {
+                    break;
+                }
+            }
+        })
+        .await;
     }
 }
 
@@ -88,14 +157,7 @@ async fn keep_connected(
     let accept = [keyboard];
     let config = ConnectConfig {
         scan_config: ScanConfig { filter_accept_list: &accept, ..ScanConfig::default() },
-        connect_params: RequestedConnParams {
-            min_connection_interval: Duration::from_millis(15),
-            max_connection_interval: Duration::from_millis(30),
-            max_latency: 0,
-            min_event_length: Duration::from_secs(0),
-            max_event_length: Duration::from_secs(0),
-            supervision_timeout: Duration::from_secs(4),
-        },
+        connect_params: connect_params(),
     };
     let mut found: Option<Found> = remembered;
     let mut failures: u64 = 0;
@@ -111,22 +173,7 @@ async fn keep_connected(
         };
         let mut encrypted = false;
         let result = connected(stack, &conn, shared, &mut found, &mut encrypted).await;
-        match &result {
-            Ok(reason) => log::info!("keyboard disconnected: {reason}"),
-            Err(e) => log::warn!("keyboard session ended: {e}"),
-        }
-        if conn.is_connected() {
-            conn.disconnect();
-            let _ = with_timeout(Duration::from_secs(3), async {
-                loop {
-                    if let ConnectionEvent::Disconnected { .. } = conn.next().await {
-                        break;
-                    }
-                }
-            })
-            .await;
-        }
-        drop(conn);
+        finish(conn, &result).await;
         // A link that carried keys ends normally (the keyboard's idle
         // timeout, say): wait for the next key press at once, since the
         // keyboard keeps presses for the reconnection. Backing off is only
@@ -233,7 +280,7 @@ fn ms(d: Duration) -> String {
 }
 
 /// Accept the keyboard's connection parameter request, and say so.
-async fn answer(stack: &'static Stack<'static, Ctrl, Pool>, req: ConnectionParamsRequest) {
+pub(crate) async fn answer(stack: &'static Stack<'static, Ctrl, Pool>, req: ConnectionParamsRequest) {
     let p = req.params().clone();
     let result = req.accept(None, stack).await;
     let asked = alloc::format!(
@@ -274,7 +321,17 @@ async fn connected(
     if let Some(req) = params.take() {
         answer(stack, req).await;
     }
+    serve(stack, conn, shared, found).await
+}
 
+/// An encrypted connection, to its end: the keyboard's layout (checked,
+/// or discovered), its notifications, the LED writes, and its requests.
+async fn serve(
+    stack: &'static Stack<'static, Ctrl, Pool>,
+    conn: &Connection<'static, Pool>,
+    shared: &'static Shared,
+    found: &mut Option<Found>,
+) -> Result<String, String> {
     let gatt = async {
         let client = match GattClient::<Ctrl, Pool, 8>::new(stack, conn).await {
             Ok(client) => client,
@@ -313,7 +370,7 @@ async fn connected(
                     log::info!("keyboard input report at {:#06x}: {:?}", f.layout.input, f.layout.report);
                     shared.layout.set(Some(f.layout));
                     *found = Some(f);
-                    crate::cache::store(&f);
+                    crate::cache::store(&f, shared.keyboard.get());
                     f
                 }
             };

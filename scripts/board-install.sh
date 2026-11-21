@@ -10,6 +10,10 @@
 #   - bt-kb-dxe.efi (build it first, as yourself: scripts/build-rust.sh);
 #   - the MT7922 firmware image, from linux-firmware: the driver only reads
 #     it to ask the chip whether its firmware is loaded, and never uploads;
+#   - (a driver built to pair in firmware, BT_KB_FEATURES=pairing, needs no
+#     bond: with none in qemu/keys/, none is installed, and the driver
+#     offers pairing at boot. --pair asks an installed one for a new
+#     pairing at the next boot: it leaves bt-kb-dxe.pair next to it.)
 #   - the keyboard's bond from qemu/keys/ (sudo scripts/export-bond.sh). It
 #     holds the keyboard's link key, so it only stays until the next boot:
 #     the driver copies it into a variable the OS can't read (BtKbBond, no
@@ -66,8 +70,9 @@ for arg in "$@"; do
   case "$arg" in
     --dry-run) dry=1 ;;
     --remove) mode=remove ;;
+    --pair) mode=pair ;;
     --force) force=1 ;;
-    *) echo "usage: $0 [--dry-run] [--remove [--force]]" >&2; exit 2 ;;
+    *) echo "usage: $0 [--dry-run] [--pair | --remove [--force]]" >&2; exit 2 ;;
   esac
 done
 
@@ -152,7 +157,7 @@ if [ "$mode" = remove ]; then
   [ -e "$marker" ] && run rm -f "$marker"
   "$ROOT/scripts/board-diag.sh" --remove ${dry:+--dry-run}
   remove_entries
-  for f in bt-kb-dxe.efi btlog.efi bt-kb-dxe.sealed "$FW_NAME"; do
+  for f in bt-kb-dxe.efi btlog.efi bt-kb-dxe.sealed bt-kb-dxe.pair "$FW_NAME"; do
     [ -e "$DEST/$f" ] && run rm -f "$DEST/$f"
   done
   for f in "$DEST"/*.bond; do
@@ -231,12 +236,42 @@ if [ ! -f "$DRIVER" ]; then
   echo "No driver build at $DRIVER. Build it first (as yourself): scripts/build-rust.sh" >&2
   exit 1
 fi
+# What the build can do (scripts/build-rust.sh writes it next to it).
+pairs=""
+grep -qxE 'pairing|insecure-legacy-pairing' "$(dirname "$DRIVER")/bt-kb-dxe.features" 2>/dev/null && pairs=1
+
+if [ "$mode" = pair ]; then
+  # Ask the installed driver for a new pairing at the next boot. The bond
+  # it has stays in use until a keyboard has been paired.
+  if [ -z "$pairs" ]; then
+    echo "The driver build can't pair in firmware. Build one that can: BT_KB_FEATURES=pairing scripts/build-rust.sh" >&2
+    exit 1
+  fi
+  if ! cmp -s "$DRIVER" "$DEST/bt-kb-dxe.efi"; then
+    echo "The installed driver isn't this build (or none is installed). Install first: sudo $0" >&2
+    exit 1
+  fi
+  if grep -qx 'fallback=no' "$DEST/bt-kb-dxe.sealed" 2>/dev/null; then
+    echo "The bond is sealed to the TPM without a fallback copy (fallback=no), and a bond paired in firmware" >&2
+    echo "would be an unsealed one: the driver ignores the request. Reseal without --no-fallback first." >&2
+    exit 1
+  fi
+  run touch "$DEST/bt-kb-dxe.pair"
+  echo "At the next boot the PC waits for a keyboard in pairing mode and shows a passkey to type on it."
+  echo "Until one is paired, the keyboard it has now stays in use."
+  exit 0
+fi
+
 bonds=("$ROOT"/qemu/keys/*.bond)
-if [ ! -f "${bonds[0]}" ] || [ "${#bonds[@]}" -ne 1 ]; then
+if [ ! -f "${bonds[0]}" ] && [ -n "$pairs" ]; then
+  echo "No exported bond in qemu/keys/: installing without one. The driver pairs in firmware."
+  bonds=()
+elif [ ! -f "${bonds[0]}" ] || [ "${#bonds[@]}" -ne 1 ]; then
   echo "Need exactly one exported bond in qemu/keys/ (sudo scripts/export-bond.sh)." >&2
+  [ -n "$pairs" ] || echo "(Or a driver that pairs in firmware: BT_KB_FEATURES=pairing scripts/build-rust.sh)" >&2
   exit 1
 fi
-if ! grep -qx "$(python3 -I "$ROOT/scripts/bond-digest.py" "${bonds[0]}")" "$(dirname "$DRIVER")/bt-kb-dxe.bonds" 2>/dev/null; then
+if [ "${#bonds[@]}" -eq 1 ] && ! grep -qx "$(python3 -I "$ROOT/scripts/bond-digest.py" "${bonds[0]}")" "$(dirname "$DRIVER")/bt-kb-dxe.bonds" 2>/dev/null; then
   echo "The driver build doesn't trust ${bonds[0]##*/} (exported after the build?)." >&2
   echo "Rebuild first, as yourself: scripts/build-rust.sh" >&2
   exit 1
@@ -302,7 +337,32 @@ done
 # bond file never goes on the ESP; the seal is renewed for the new driver.
 sealed_only=""
 grep -qx 'fallback=no' "$DEST/bt-kb-dxe.sealed" 2>/dev/null && sealed_only=1
-if [ -n "$sealed_only" ]; then
+if [ -n "$pairs" ]; then
+  # A bond the driver makes has to reach the OS: under the key the driver
+  # was built with, opened by its private half (scripts/bond-handoff.py).
+  built_for="$(cat "$(dirname "$DRIVER")/bt-kb-dxe.handoff" 2>/dev/null || true)"
+  os_key="${HANDOFF_KEY:-/etc/bt-kb/handoff.key}"
+  if [ -z "$built_for" ]; then
+    echo "WARNING: the driver was built without a hand-off key: a keyboard paired in firmware won't work in the OS."
+    echo "  Make one (once): sudo python3 -I scripts/bond-handoff.py keygen $os_key"
+    echo "  and build with what it prints in private/handoff.pub (or BT_KB_HANDOFF_KEY)."
+  elif [ ! -r "$os_key" ]; then
+    echo "The driver hands its bond over under the key ${built_for:0:10}...; $os_key isn't readable here, so it isn't compared."
+  elif [ "$(python3 -I "$ROOT/scripts/bond-handoff.py" pubkey "$os_key" 2>/dev/null)" != "$built_for" ]; then
+    echo "WARNING: the driver was built for another hand-off key than $os_key: the OS couldn't open its bond." >&2
+    echo "  Build again with: python3 -I scripts/bond-handoff.py pubkey $os_key > private/handoff.pub" >&2
+  else
+    echo "The driver hands its bond over under the key of $os_key."
+    [ -e /etc/systemd/system/bt-kb-handoff.service ] || echo "  To give it to BlueZ at every boot: scripts/systemd/bt-kb-handoff.service (see the file)."
+  fi
+fi
+if [ "${#bonds[@]}" -eq 0 ]; then
+  if [ -n "$sealed_only" ]; then
+    echo "WARNING: a bond is sealed to the TPM without a fallback copy (fallback=no): this driver won't pair in firmware."
+  else
+    echo "At a boot without a paired keyboard, the PC waits for one in pairing mode and shows a passkey."
+  fi
+elif [ -n "$sealed_only" ]; then
   echo "The bond is sealed to the TPM without a fallback copy (fallback=no): not copying ${bonds[0]##*/}."
 else
   run cp "${bonds[0]}" "$DEST/"

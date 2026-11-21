@@ -23,6 +23,17 @@
 //!   fails, unless the seal says `fallback=no`: then a trusted `.bond`
 //!   file is deleted without importing it, and `BtKbBond` is deleted too,
 //!   so the key is nowhere but in the sealed object.
+//! - **Paired in firmware** (the `pairing` feature, `crate::pair`): a bond
+//!   the driver made itself can't be pinned by the build. It is kept in a
+//!   variable of its own, `BtKbPaired`, boot-services only like
+//!   `BtKbBond`, and a build with the feature trusts what it finds there:
+//!   only code that ran before the OS can have written it. That rests on
+//!   Secure Boot (nothing unsigned runs before the OS) and on the
+//!   firmware's flash being write-protected, where a pinned bond rests on
+//!   the signed driver alone. A build without the feature never looks at
+//!   it. `bt-kb-dxe.pair` next to the driver asks for a new pairing at
+//!   the next boot; a bond installed from the OS afterwards replaces a
+//!   paired one.
 
 use alloc::string::String;
 
@@ -35,7 +46,12 @@ use uefi_bt::bond::{wipe_bytes, ExportedBond, RECORD_LEN};
 use crate::dlog::VENDOR;
 
 const NAME: &CStr16 = cstr16!("BtKbBond");
+/// The bond of a pairing done in firmware.
+const PAIRED: &CStr16 = cstr16!("BtKbPaired");
 pub const MARKER: &str = "bt-kb-dxe.forget";
+/// Asks for a new pairing in firmware at this boot (once).
+#[cfg(feature = "pairing")]
+pub const PAIR_MARKER: &str = "bt-kb-dxe.pair";
 
 /// Where this boot's bond came from, for the log and the boot record.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -48,6 +64,9 @@ pub enum Source {
     Stored,
     /// Unsealed from the TPM (stage 4).
     Unsealed,
+    /// Made by pairing in firmware at an earlier boot.
+    #[cfg(feature = "pairing")]
+    Paired,
 }
 
 impl Source {
@@ -57,6 +76,8 @@ impl Source {
             Self::File => "from the ESP (not imported)",
             Self::Stored => "stored",
             Self::Unsealed => "unsealed from the TPM",
+            #[cfg(feature = "pairing")]
+            Self::Paired => "paired in firmware",
         }
     }
 }
@@ -71,8 +92,12 @@ fn trusted(bond: &ExportedBond, pins: &[[u8; 32]]) -> bool {
 }
 
 fn read_stored() -> Option<ExportedBond> {
+    read_variable(NAME)
+}
+
+fn read_variable(name: &CStr16) -> Option<ExportedBond> {
     let mut buf = [0u8; RECORD_LEN + 1];
-    let bond = runtime::get_variable(NAME, &VENDOR, &mut buf).ok().and_then(|(data, attrs)| {
+    let bond = runtime::get_variable(name, &VENDOR, &mut buf).ok().and_then(|(data, attrs)| {
         // A variable someone made with other attributes isn't ours.
         (attrs == attributes()).then(|| ExportedBond::from_record(data).ok()).flatten()
     });
@@ -82,11 +107,15 @@ fn read_stored() -> Option<ExportedBond> {
 
 /// Copy the bond into the variable; `true` once it reads back right.
 fn store(bond: &ExportedBond) -> bool {
+    store_variable(NAME, bond)
+}
+
+fn store_variable(name: &CStr16, bond: &ExportedBond) -> bool {
     let mut record = bond.record();
-    let written = runtime::set_variable(NAME, &VENDOR, attributes(), &record);
+    let written = runtime::set_variable(name, &VENDOR, attributes(), &record);
     let mut back = [0u8; RECORD_LEN + 1];
     let same = written.is_ok()
-        && matches!(runtime::get_variable(NAME, &VENDOR, &mut back), Ok((data, attrs)) if data == record && attrs == attributes());
+        && matches!(runtime::get_variable(name, &VENDOR, &mut back), Ok((data, attrs)) if data == record && attrs == attributes());
     wipe_bytes(&mut record);
     wipe_bytes(&mut back);
     if let Err(e) = written {
@@ -102,18 +131,56 @@ fn forget() {
         Err(e) if e.status() == uefi::Status::NOT_FOUND => info!("{MARKER}: there was no stored bond"),
         Err(e) => error!("deleting the stored bond failed: {:?}", e.status()),
     }
+    forget_paired("as asked");
     if let Err(e) = app::delete_file(MARKER) {
         warn!("deleting {MARKER} failed: {e}");
     }
 }
 
-/// Delete `BtKbBond`: the seal allows no copy outside the TPM.
+/// The bond of a pairing done in firmware, if there is one. Only a build
+/// with the `pairing` feature asks.
+#[cfg(feature = "pairing")]
+pub fn paired() -> Option<ExportedBond> {
+    read_variable(PAIRED)
+}
+
+/// Keep the bond of a pairing done at this boot; `true` once it reads
+/// back right.
+#[cfg(feature = "pairing")]
+pub fn store_paired(bond: &ExportedBond) -> bool {
+    store_variable(PAIRED, bond)
+}
+
+fn forget_paired(why: &str) {
+    match runtime::delete_variable(PAIRED, &VENDOR) {
+        Ok(()) => info!("the bond paired in firmware was deleted, {why}"),
+        Err(e) if e.status() == uefi::Status::NOT_FOUND => {}
+        Err(e) => error!("deleting the bond paired in firmware failed: {:?}", e.status()),
+    }
+}
+
+/// `bt-kb-dxe.pair` next to the driver: a new pairing is asked for. The
+/// marker is deleted, so it asks once.
+#[cfg(feature = "pairing")]
+pub fn pairing_requested() -> bool {
+    if app::read_file(PAIR_MARKER).is_err() {
+        return false;
+    }
+    if let Err(e) = app::delete_file(PAIR_MARKER) {
+        warn!("deleting {PAIR_MARKER} failed ({e}): it will ask for a pairing again at the next boot");
+    }
+    true
+}
+
+/// Delete `BtKbBond`, and a bond paired in firmware before the seal was
+/// made: the seal allows no copy outside the TPM.
 fn drop_stored() {
     match runtime::delete_variable(NAME, &VENDOR) {
         Ok(()) => info!("the boot-services copy of the bond was deleted: the seal allows none (fallback=no)"),
         Err(e) if e.status() == uefi::Status::NOT_FOUND => {}
         Err(e) => error!("deleting the boot-services copy of the bond failed: {:?}", e.status()),
     }
+    forget_paired("since the seal allows no copy outside the TPM (fallback=no)");
 }
 
 /// This boot's bond. `unsealed`: the bond unsealed from the TPM, if any;
@@ -144,6 +211,8 @@ pub fn load(pins: &[[u8; 32]], unsealed: Option<ExportedBond>, keep_copy: bool) 
         ));
     }
     if let Some(found) = imported {
+        // Newer than anything paired in firmware before it.
+        forget_paired("replaced by the bond just installed");
         return Ok(found);
     }
     match read_stored() {

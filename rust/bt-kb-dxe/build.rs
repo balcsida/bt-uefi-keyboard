@@ -18,6 +18,13 @@
 // it tried to unseal its bond, so nothing that runs later can unseal it. A
 // build setting, not a file on the ESP: whoever can write the ESP must not
 // be able to make the driver skip it.
+//
+// And the key a bond paired in firmware is handed to the OS under (the
+// `pairing` feature): BT_KB_HANDOFF_KEY is a P-256 public key, 65 bytes
+// uncompressed, in hex (scripts/bond-handoff.py keygen prints it). The
+// driver publishes such a bond encrypted to it and to nothing else, so
+// whoever can write the ESP can't have it handed to a key of theirs.
+// Without it the driver hands nothing over.
 use std::{env, fs, path::Path};
 
 use sha2::{Digest, Sha256};
@@ -27,6 +34,20 @@ fn main() {
     println!("cargo:rerun-if-env-changed=BT_KB_FIRMWARE");
     println!("cargo:rerun-if-env-changed=BT_KB_BOND_DIGESTS");
     println!("cargo:rerun-if-env-changed=BT_KB_SPARE_PCR");
+    println!("cargo:rerun-if-env-changed=BT_KB_HANDOFF_KEY");
+    let handoff = match env::var("BT_KB_HANDOFF_KEY").as_deref().map(str::trim) {
+        Err(_) | Ok("") => String::from("None"),
+        Ok(hex) => {
+            let bytes: Vec<u8> = (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(hex.get(i..i + 2).unwrap_or("x"), 16))
+                .collect::<Result<_, _>>()
+                .unwrap_or_else(|_| panic!("BT_KB_HANDOFF_KEY: not hex"));
+            let point: [u8; 65] = bytes.try_into().unwrap_or_else(|_| panic!("BT_KB_HANDOFF_KEY: not 65 bytes (an uncompressed P-256 point)"));
+            assert!(point[0] == 0x04, "BT_KB_HANDOFF_KEY: not an uncompressed point (it doesn't start with 04)");
+            format!("Some({point:?})")
+        }
+    };
     let spare = match env::var("BT_KB_SPARE_PCR").as_deref().map(str::trim) {
         Err(_) | Ok("") => Some(8u32),
         Ok("none") => None,
@@ -67,7 +88,11 @@ fn main() {
              /// Digests of the only bonds this build trusts (`BT_KB_BOND_DIGESTS`).\n\
              pub const TRUSTED_BONDS: &[[u8; 32]] = &{bonds:?};\n\
              /// The PCR the driver extends after trying to unseal (`BT_KB_SPARE_PCR`).\n\
-             pub const SPARE_PCR: Option<u32> = {spare:?};\n"
+             pub const SPARE_PCR: Option<u32> = {spare:?};\n\
+             /// The public key a bond paired in firmware is handed to the OS\n\
+             /// under (`BT_KB_HANDOFF_KEY`; `None`: it isn't handed over).\n\
+             #[allow(dead_code)]\n\
+             pub const HANDOFF_KEY: Option<[u8; 65]> = {handoff};\n"
         ),
     )
     .expect("writing pins.rs");

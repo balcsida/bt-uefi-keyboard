@@ -45,8 +45,12 @@ mod cache;
 mod cell;
 mod sealed;
 mod dlog;
+#[cfg(feature = "pairing")]
+mod pair;
 mod record;
 mod safety;
+#[cfg(feature = "pairing")]
+mod screen;
 mod selftest;
 mod session;
 mod textin;
@@ -123,10 +127,33 @@ const SHELL_PROTOCOL: Guid = guid!("6302d008-7f9b-4f30-87ac-60c9fef5da4e");
 
 struct Config {
     fw: FirmwareImage<'static>,
-    bond: ExportedBond,
+    /// The bond this boot starts with. None before a first pairing in
+    /// firmware (only a build with the `pairing` feature starts without).
+    bond: Option<ExportedBond>,
     /// Power off after this many milliseconds (test sessions only).
     time_limit_ms: Option<u64>,
+    /// Loaded from a UEFI shell, not by the firmware at boot.
+    #[cfg_attr(not(feature = "pairing"), allow(dead_code))]
+    from_shell: bool,
+    /// Pairing in firmware is offered at this boot, and why.
+    #[cfg(feature = "pairing")]
+    pairing: Option<screen::Why>,
+    /// How long the boot waits for a pairing to begin.
+    #[cfg(feature = "pairing")]
+    pair_wait_ms: u64,
 }
+
+/// Test hook: seconds the boot waits for a pairing to begin.
+#[cfg(feature = "pairing")]
+const PAIR_WAIT_FILE: &str = "bt-kb-dxe.pairwait";
+/// ... and how long it waits without one. Long enough to read the screen
+/// and reach for the keyboard's pairing button.
+#[cfg(feature = "pairing")]
+const PAIR_WAIT_MS: u64 = 30_000;
+/// EFI_EVENT_GROUP_READY_TO_BOOT: the boot manager is about to start a
+/// boot option. The consoles are up by then, and nothing has been started.
+#[cfg(feature = "pairing")]
+const READY_TO_BOOT: Guid = guid!("7ce88fb3-4bd7-4679-87a8-a8d8dee50d2b");
 
 /// Set once by the entry point, read-only afterwards.
 static CONFIG: AtomicPtr<Config> = AtomicPtr::new(core::ptr::null_mut());
@@ -172,6 +199,23 @@ struct Link {
     keys_flowing: bool,
 }
 
+/// The tick's part in pairing in firmware.
+#[cfg(feature = "pairing")]
+struct PairingSide {
+    /// Random bytes of the driver's own, for the host stack's seed.
+    rng: uefi_bt::rng::Rng,
+    le_rand_mixed: u32,
+    /// The host stack's memory. A pairing's keys were made in it, so it
+    /// is wiped at the hand-off of a boot that paired.
+    stack_memory: [(*mut u8, usize); 2],
+    paired: bool,
+    /// The stage last shown (a driver loaded from a shell shows lines).
+    shown: pair::Stage,
+    /// Data from a pairing link that came before the controller's word
+    /// that the link is encrypted (see `hold_acl`).
+    held_acl: Vec<Vec<u8>>,
+}
+
 struct Driver {
     hci: &'static RefCell<UsbHci>,
     inbox: &'static Inbox,
@@ -183,6 +227,11 @@ struct Driver {
     /// guard the host stack's packets pass on their way to the controller.
     tap: LinkTap,
     guard: &'static LinkGuard,
+    /// The controller's own address: a bond made here belongs to it.
+    #[cfg_attr(not(feature = "pairing"), allow(dead_code))]
+    adapter: [u8; 6],
+    #[cfg(feature = "pairing")]
+    pairing: PairingSide,
     /// Pairing (SMP) packets from the keyboard, kept from the host stack.
     smp_in: SmpFilter,
     link: Link,
@@ -240,7 +289,7 @@ fn main() -> Status {
     let loaded_at = clock::since_reset_ms();
     info!("bt-kb-dxe {VERSION} starting from {} ({origin}, {loaded_at} ms after the CPU reset)", app::image_dir());
     record::init(loaded_at, shell);
-    let status = load();
+    let status = load(shell);
     if status.is_success() {
         // SAFETY: a tag without an interface on our own image handle.
         let tagged = unsafe { boot::install_protocol_interface(Some(boot::image_handle()), &INSTANCE, core::ptr::null()) };
@@ -252,7 +301,82 @@ fn main() -> Status {
     status
 }
 
-fn load() -> Status {
+/// The variable a bond paired in firmware is handed to the OS in: volatile,
+/// and readable by anyone there, which is why it is encrypted.
+#[cfg(feature = "pairing")]
+const HAND_OFF: &uefi::CStr16 = uefi::cstr16!("BtKbHandOff");
+
+/// Hand a bond that was paired in firmware to the OS: encrypted to the
+/// public key this driver was built with (`uefi_bt::handoff`), for
+/// `scripts/bond-handoff.py` to give to the OS's Bluetooth stack. The
+/// keyboard holds one key per host, so the OS must use this bond, and
+/// can't be left to pair again. At every boot, with a new ephemeral key.
+#[cfg(feature = "pairing")]
+fn hand_off_bond(bond: &ExportedBond, rng: &mut uefi_bt::rng::Rng) {
+    use uefi::runtime::VariableAttributes;
+    let Some(recipient) = HANDOFF_KEY else {
+        warn!("this build has no hand-off key (BT_KB_HANDOFF_KEY): the OS can't take the bond over, and would have to pair anew");
+        return;
+    };
+    // The message is only as secret as the ephemeral key is random.
+    if !rng.cpu {
+        error!("no random numbers from the CPU: the bond isn't handed to the OS");
+        return;
+    }
+    let mut record = bond.record();
+    let blob = uefi_bt::handoff::seal(&record, &recipient, rng);
+    uefi_bt::bond::wipe_bytes(&mut record);
+    let Some(blob) = blob else {
+        error!("the build's hand-off key isn't a point on P-256: the bond isn't handed to the OS");
+        return;
+    };
+    let attributes = VariableAttributes::BOOTSERVICE_ACCESS | VariableAttributes::RUNTIME_ACCESS;
+    match uefi::runtime::set_variable(HAND_OFF, &dlog::VENDOR, attributes, &blob) {
+        Ok(()) => info!("the bond is handed to the OS, encrypted to the build's hand-off key (BtKbHandOff, {} bytes)", blob.len()),
+        Err(e) => error!("handing the bond to the OS failed: {:?}", e.status()),
+    }
+}
+
+/// What this boot has for a bond, and whether it offers pairing: with no
+/// bond at all, or when `bt-kb-dxe.pair` asks for a new one.
+#[cfg(feature = "pairing")]
+fn bond_or_pairing(
+    loaded: Result<(ExportedBond, bondstore::Source), String>,
+    keep_copy: bool,
+) -> (Result<Option<(ExportedBond, bondstore::Source)>, String>, Option<screen::Why>) {
+    use bondstore::Source;
+    let requested = bondstore::pairing_requested();
+    if !keep_copy {
+        // A seal with fallback=no allows no copy of the key outside the
+        // TPM, and a bond paired here would be one: the driver can't seal.
+        if requested {
+            warn!("{} is ignored: the sealed bond allows no unsealed copy (fallback=no)", bondstore::PAIR_MARKER);
+        }
+        return (loaded.map(Some), None);
+    }
+    let found = match loaded {
+        // Installed from the OS just now: newer than anything paired here.
+        Ok(found @ (_, Source::Imported | Source::File)) => Some(found),
+        older => match bondstore::paired() {
+            Some(paired) => Some((paired, Source::Paired)),
+            None => match older {
+                Ok(found) => Some(found),
+                Err(e) => {
+                    info!("no bond from an OS: {e}");
+                    None
+                }
+            },
+        },
+    };
+    let why = match (&found, requested) {
+        (None, _) => Some(screen::Why::Unpaired),
+        (Some(_), true) => Some(screen::Why::Requested),
+        (Some(_), false) => None,
+    };
+    (Ok(found), why)
+}
+
+fn load(from_shell: bool) -> Status {
     match record::previous() {
         Some(text) => info!("previous boot: {text}"),
         None => info!("previous boot: no record"),
@@ -320,14 +444,35 @@ fn load() -> Status {
             return Status::VOLUME_CORRUPTED;
         }
     };
-    let bond = match bondstore::load(TRUSTED_BONDS, unsealed, keep_copy) {
-        Ok((bond, source)) => {
+    // A forget marker ends this boot's start (`bondstore::load` acts on
+    // it), whether or not the build can pair.
+    #[cfg(feature = "pairing")]
+    let forgetting = app::read_file(bondstore::MARKER).is_ok();
+    let loaded = bondstore::load(TRUSTED_BONDS, unsealed, keep_copy);
+    #[cfg(feature = "pairing")]
+    let (loaded, pairing) = if forgetting { (loaded.map(Some), None) } else { bond_or_pairing(loaded, keep_copy) };
+    #[cfg(not(feature = "pairing"))]
+    let loaded = loaded.map(Some);
+    let bond = match loaded {
+        Ok(Some((bond, source))) => {
             record::update(|r| {
                 r.bond = Some(source.text());
                 false
             });
             info!("{} ({})", bond.summary(), source.text());
-            bond
+            #[cfg(feature = "pairing")]
+            if source == bondstore::Source::Paired {
+                let mut rng = uefi_bt::tcg::open().map_or_else(|| uefi_bt::rng::Rng::new(&[]), |mut tcg| uefi_bt::tcg::session_rng(&mut tcg));
+                hand_off_bond(&bond, &mut rng);
+            }
+            Some(bond)
+        }
+        Ok(None) => {
+            record::update(|r| {
+                r.bond = Some("none");
+                false
+            });
+            None
         }
         Err(e) => {
             error!("{e}");
@@ -335,14 +480,39 @@ fn load() -> Status {
             return Status::NOT_FOUND;
         }
     };
-    let time_limit_ms = app::read_file(TIME_LIMIT_FILE)
-        .ok()
-        .and_then(|data| core::str::from_utf8(&data).ok()?.trim().parse::<u64>().ok())
-        .map(|seconds| seconds * 1000);
+    let seconds_in = |file: &str| app::read_file(file).ok().and_then(|data| core::str::from_utf8(&data).ok()?.trim().parse::<u64>().ok());
+    let time_limit_ms = seconds_in(TIME_LIMIT_FILE).map(|seconds| seconds * 1000);
     if let Some(limit) = time_limit_ms {
         info!("test session: powering off {} s after the controller starts", limit / 1000);
     }
-    CONFIG.store(Box::into_raw(Box::new(Config { fw, bond, time_limit_ms })), Ordering::Release);
+    #[cfg(feature = "pairing")]
+    let pair_wait_ms = {
+        match pairing {
+            Some(screen::Why::Unpaired) => info!("no keyboard is paired with this PC: pairing is offered at this boot"),
+            Some(screen::Why::Requested) => info!("{} asked for a new pairing: offered at this boot", bondstore::PAIR_MARKER),
+            None => {}
+        }
+        if pairing.is_some() {
+            record::update(|r| {
+                r.pairing = Some("offered, nothing paired");
+                false
+            });
+        }
+        seconds_in(PAIR_WAIT_FILE).map_or(PAIR_WAIT_MS, |seconds| seconds.min(300) * 1000)
+    };
+    CONFIG.store(
+        Box::into_raw(Box::new(Config {
+            fw,
+            bond,
+            time_limit_ms,
+            from_shell,
+            #[cfg(feature = "pairing")]
+            pairing,
+            #[cfg(feature = "pairing")]
+            pair_wait_ms,
+        })),
+        Ordering::Release,
+    );
 
     if let Err(e) = install_binding(image) {
         error!("installing the driver binding failed: {e:?}");
@@ -570,16 +740,19 @@ fn start_driver(controller: Handle, agent: Handle) -> Result<(), Status> {
     if hci.pipe_stats().is_none() {
         warn!("no asynchronous event transfer; events are read synchronously");
     }
-    if let Err(e) = bring_up(&mut hci, cfg) {
-        error!("{e}");
-        record::failed(clock::now_ms(), &e);
-        app::hand_off(&mut hci, true);
-        hci.close();
-        if FAILED_STARTS.fetch_add(1, Ordering::Relaxed) + 1 >= START_ATTEMPTS {
-            error!("the controller couldn't be started {START_ATTEMPTS} times: leaving it alone until the next boot");
+    let adapter = match bring_up(&mut hci, cfg) {
+        Ok(adapter) => adapter,
+        Err(e) => {
+            error!("{e}");
+            record::failed(clock::now_ms(), &e);
+            app::hand_off(&mut hci, true);
+            hci.close();
+            if FAILED_STARTS.fetch_add(1, Ordering::Relaxed) + 1 >= START_ATTEMPTS {
+                error!("the controller couldn't be started {START_ATTEMPTS} times: leaving it alone until the next boot");
+            }
+            return Err(Status::DEVICE_ERROR);
         }
-        return Err(Status::DEVICE_ERROR);
-    }
+    };
     info!("controller ready in {} ms", clock::now_ms() - started);
     let ready = clock::now_ms();
     record::update(|r| {
@@ -592,23 +765,43 @@ fn start_driver(controller: Handle, agent: Handle) -> Result<(), Status> {
     let inbox: &'static Inbox = Box::leak(Box::default());
     let shared: &'static Shared = Box::leak(Box::default());
     let resources: &'static mut HostResources<Pool, 1, 4> = Box::leak(Box::new(HostResources::new()));
-    let guard: &'static LinkGuard =
-        Box::leak(Box::new(LinkGuard::new(BondKey::new(cfg.bond.ediv, cfg.bond.rand_bytes(), cfg.bond.ltk))));
+    #[cfg(feature = "pairing")]
+    let resources_memory = (core::ptr::from_mut(resources).cast::<u8>(), size_of::<HostResources<Pool, 1, 4>>());
+    let key = match &cfg.bond {
+        Some(bond) => BondKey::new(bond.ediv, bond.rand_bytes(), bond.ltk),
+        None => BondKey::none(),
+    };
+    let guard: &'static LinkGuard = Box::leak(Box::new(LinkGuard::new(key)));
     let controller_hci: Ctrl = ExternalController::new(InboxTransport::new(hci, inbox).with_guard(guard));
     if REPLAY_UNENCRYPTED {
         warn!("built with insecure-replay-unencrypted: key reports from before the link is encrypted are delivered");
     }
     let stack: &'static Stack<'static, Ctrl, Pool> = Box::leak(Box::new(trouble_host::new(controller_hci, resources).build()));
-    if let Err(e) = stack.add_bond_information(bond_information(&cfg.bond)) {
-        error!("importing the bond failed: {e:?}");
-        record::failed(clock::now_ms(), "importing the bond failed");
-        app::hand_off(&mut hci.borrow_mut(), true);
-        hci.borrow_mut().close();
-        return Err(Status::DEVICE_ERROR);
+    if let Some(bond) = &cfg.bond {
+        if let Err(e) = stack.add_bond_information(bond_information(bond)) {
+            error!("importing the bond failed: {e:?}");
+            record::failed(clock::now_ms(), "importing the bond failed");
+            app::hand_off(&mut hci.borrow_mut(), true);
+            hci.borrow_mut().close();
+            return Err(Status::DEVICE_ERROR);
+        }
     }
-    let kind = if cfg.bond.peer_is_random { AddrKind::RANDOM } else { AddrKind::PUBLIC };
-    let keyboard = Address::new(kind, BdAddr::new(cfg.bond.peer));
-    let remembered = cache::load(&cfg.bond);
+    shared.keyboard.set(cfg.bond.as_ref().map(|bond| (bond.peer, bond.peer_is_random)));
+    #[cfg(feature = "pairing")]
+    if cfg.pairing.is_some() {
+        // The driver can show a passkey, and nothing else: a keyboard has
+        // to take it as input (passkey entry). Legacy pairing only if the
+        // build allows it.
+        stack.set_io_capabilities(trouble_host::prelude::IoCapabilities::DisplayOnly);
+        stack.set_secure_connections_only(!pair::LEGACY);
+        shared.pairing.offered.set(true);
+        // From a shell there is a console, and no boot to hold up.
+        shared.pairing.go.set(cfg.from_shell);
+        if pair::LEGACY {
+            warn!("built with insecure-legacy-pairing: a device in radio range can pair in the keyboard's place while pairing is offered");
+        }
+    }
+    let remembered = cfg.bond.as_ref().and_then(cache::load);
     match &remembered {
         Some(f) => {
             info!("using the keyboard layout remembered from an earlier boot (input report at {:#06x})", f.layout.input);
@@ -616,11 +809,13 @@ fn start_driver(controller: Handle, agent: Handle) -> Result<(), Status> {
         }
         None => info!("no remembered keyboard layout: the first connection discovers it"),
     }
-    let future: Pin<Box<dyn Future<Output = ()>>> = Box::pin(session::run(stack, shared, keyboard, remembered));
+    let future: Pin<Box<dyn Future<Output = ()>>> = Box::pin(session::run(stack, shared, remembered));
 
-    // The console input device: parent's device path plus a BluetoothLE node.
+    // The console input device: parent's device path plus a BluetoothLE
+    // node (with the address zero while no keyboard is paired).
     let parent_path = open_get::<DevicePath>(controller).map(|p| p.as_bytes().to_vec()).unwrap_or_default();
-    let path = textin::bluetooth_le_path(&parent_path, cfg.bond.peer, cfg.bond.peer_is_random);
+    let (peer, peer_is_random) = shared.keyboard.get().unwrap_or(([0; 6], false));
+    let path = textin::bluetooth_le_path(&parent_path, peer, peer_is_random);
     let mut child = match Child::install(path) {
         Ok(child) => child,
         Err(e) => {
@@ -653,8 +848,21 @@ fn start_driver(controller: Handle, agent: Handle) -> Result<(), Status> {
             future: Some(future),
             timer: Some(timer),
             child: Some(child),
-            tap: LinkTap::new(cfg.bond.peer, cfg.bond.peer_is_random, REPLAY_UNENCRYPTED),
+            tap: match &cfg.bond {
+                Some(bond) => LinkTap::new(bond.peer, bond.peer_is_random, REPLAY_UNENCRYPTED),
+                None => LinkTap::unpaired(REPLAY_UNENCRYPTED),
+            },
             guard,
+            adapter,
+            #[cfg(feature = "pairing")]
+            pairing: PairingSide {
+                rng: uefi_bt::tcg::open().map_or_else(|| uefi_bt::rng::Rng::new(&[]), |mut tcg| uefi_bt::tcg::session_rng(&mut tcg)),
+                le_rand_mixed: 0,
+                stack_memory: [resources_memory, (core::ptr::from_ref(stack).cast_mut().cast::<u8>(), size_of_val(stack))],
+                paired: false,
+                shown: pair::Stage::Off,
+                held_acl: Vec::new(),
+            },
             smp_in: SmpFilter::default(),
             link: Link::default(),
             violation: None,
@@ -690,7 +898,8 @@ fn start_driver(controller: Handle, agent: Handle) -> Result<(), Status> {
 
 /// The MediaTek sequence (no firmware upload), a clean HCI_Reset, and a
 /// check that this is the controller the bond belongs to.
-fn bring_up(hci: &mut UsbHci, cfg: &Config) -> Result<(), String> {
+/// Returns the controller's address.
+fn bring_up(hci: &mut UsbHci, cfg: &Config) -> Result<[u8; 6], String> {
     let drained = hci.drain(20, 300).map_err(|e| alloc::format!("draining the controller failed: {e:?}"))?;
     if !drained.is_empty() {
         let from = drained.acl_handle.map(|h| alloc::format!(" (data from handle {h:#06x})")).unwrap_or_default();
@@ -719,16 +928,16 @@ fn bring_up(hci: &mut UsbHci, cfg: &Config) -> Result<(), String> {
     let mut ret = [0u8; 8];
     match hci.command(HCI_OP_READ_BD_ADDR, &[], &mut ret, 2000) {
         Ok(n) if n >= 7 && ret[0] == 0 => {
-            if ret[1..7] != cfg.bond.adapter {
-                let mut addr = [0u8; 6];
-                addr.copy_from_slice(&ret[1..7]);
-                return Err(alloc::format!(
+            let mut addr = [0u8; 6];
+            addr.copy_from_slice(&ret[1..7]);
+            match &cfg.bond {
+                Some(bond) if bond.adapter != addr => Err(alloc::format!(
                     "this controller is {}, but the bond belongs to {}",
                     addr_text(&addr),
-                    addr_text(&cfg.bond.adapter)
-                ));
+                    addr_text(&bond.adapter)
+                )),
+                _ => Ok(addr),
             }
-            Ok(())
         }
         other => Err(alloc::format!("reading the controller address failed: {other:?}")),
     }
@@ -850,6 +1059,11 @@ impl Driver {
         }
         self.timing.last_tick_us = now_us;
         self.timing.ticks += 1;
+        // Before the controller's events are read: the connection to the
+        // device the session picked has to be a pairing link from its
+        // first event on.
+        #[cfg(feature = "pairing")]
+        self.tap.set_candidate(self.shared.pairing.candidate.get());
         if let Err(why) = self.pump(now) {
             self.fail(&why);
             return;
@@ -870,6 +1084,8 @@ impl Driver {
             self.fail(&why);
             return;
         }
+        #[cfg(feature = "pairing")]
+        self.pairing_tick(now);
         let shared = self.shared;
         self.keyboard.tick(now, &mut |e| deliver(shared, e));
         // Until the keyboard first connects: a note at 5, 10, 20 and 40 s,
@@ -931,6 +1147,8 @@ impl Driver {
             match hci.read_event(&mut buf, 0) {
                 Ok(len) => {
                     self.timing.events += 1;
+                    #[cfg(feature = "pairing")]
+                    self.pairing_event(&mut buf[..len], now);
                     let event = &buf[..len];
                     // TrouBLE `unwrap!`s typed events: never hand it a bad one.
                     if let Err(e) = HciEvent::from_hci_bytes_complete(event) {
@@ -938,6 +1156,15 @@ impl Driver {
                         continue;
                     }
                     self.tap_event(event, now);
+                    // A connection the host stack has asked the controller
+                    // to end is written off there: TrouBLE 0.8 stops
+                    // altogether if an Encryption Change still comes for
+                    // it. The tap has seen it; that is enough.
+                    if let [0x08 | 0x59, _, _, h0, h1, ..] = *event {
+                        if self.guard.closing() == Some(u16::from_le_bytes([h0, h1]) & 0x0FFF) {
+                            continue;
+                        }
+                    }
                     match encryption_change_as_v1(event) {
                         Some(v1) => self.inbox.push_event(&v1),
                         None => self.inbox.push_event(event),
@@ -950,6 +1177,8 @@ impl Driver {
         if let Some(why) = self.violation.take() {
             return Err(why);
         }
+        #[cfg(feature = "pairing")]
+        self.release_held_acl();
         if self.tap.conn().is_none() && now < self.next_idle_acl_ms {
             return Ok(());
         }
@@ -979,7 +1208,8 @@ impl Driver {
                         let packet = &buf[..acl.len];
                         // The keyboard's pairing packets never reach the
                         // host stack (see `uefi_bt::tap`).
-                        if !self.smp_in.pass(packet) {
+                        // (Except on a pairing link, while pairing is offered.)
+                        if !self.smp_in.pass_on(packet, self.guard.pairing()) {
                             continue;
                         }
                         // Notifications are the tap's alone: the host stack
@@ -991,6 +1221,10 @@ impl Driver {
                             self.timing.notifications += 1;
                             self.tap_notification(&n, now);
                         } else {
+                            #[cfg(feature = "pairing")]
+                            if self.hold_acl(packet) {
+                                continue;
+                            }
                             self.inbox.push_acl(packet);
                         }
                     }
@@ -1048,6 +1282,21 @@ impl Driver {
                     "the controller reports the keyboard link ({handle:#06x}) encrypted, but not after a start with the bonded key"
                 ));
             }
+            #[cfg(feature = "pairing")]
+            TapEvent::PairingConnected { handle } => {
+                info!("pairing: connected to the device (handle {handle:#06x}); pairing packets pass on this link");
+                self.shared.pairing.link_encrypted.set(None);
+                self.shared.pairing.failed.set(None);
+                self.smp_in.pairing_failed = None;
+            }
+            #[cfg(feature = "pairing")]
+            TapEvent::PairingEncrypted { handle, v2 } => {
+                let event = if v2 { "Encryption Change v2, passed on as v1" } else { "Encryption Change v1" };
+                info!("pairing: link encrypted with the pairing's key ({event}); no keys from it until the pairing is accepted");
+                self.shared.pairing.link_encrypted.set(Some(handle));
+            }
+            #[cfg(not(feature = "pairing"))]
+            TapEvent::PairingConnected { .. } | TapEvent::PairingEncrypted { .. } => {}
             TapEvent::EncryptionOff { .. } => {
                 info!("keyboard link no longer encrypted: key reports are dropped until it is again");
                 self.shared.encrypted.set(None);
@@ -1059,6 +1308,8 @@ impl Driver {
                     warn!("{dropped} key reports arrived on that connection before it was encrypted, and were dropped");
                 }
                 self.shared.encrypted.set(None);
+                #[cfg(feature = "pairing")]
+                self.shared.pairing.link_encrypted.set(None);
                 self.keyboard.release_all();
                 record::update(|r| {
                     r.disconnects += 1;
@@ -1069,6 +1320,165 @@ impl Driver {
                 self.timing_due = Some("while connected");
             }
         }
+    }
+
+    /// One event from the controller, before anything else sees it: the
+    /// answer to LE Rand gets random bytes of the driver's own mixed in,
+    /// and while pairing is offered, advertising reports show which
+    /// keyboards are in pairing mode.
+    #[cfg(feature = "pairing")]
+    fn pairing_event(&mut self, event: &mut [u8], now: u64) {
+        let p = &self.shared.pairing;
+        if !p.offered.get() {
+            return;
+        }
+        if uefi_bt::tap::mix_le_rand(event, &self.pairing.rng.array()) {
+            self.pairing.le_rand_mixed += 1;
+            if self.pairing.le_rand_mixed == 4 {
+                info!(
+                    "pairing: the host stack's random seed is the controller's LE Rand mixed with the driver's own random bytes ({})",
+                    if self.pairing.rng.cpu { "from the CPU, and the TPM and firmware if they have any" } else { "no CPU source: time stamps only" }
+                );
+            }
+        }
+        if !p.over.get() && p.found.borrow_mut().on_event(event, now) {
+            let found = p.found.borrow();
+            if let Some(c) = found.best(now, 0) {
+                info!(
+                    "pairing: heard {} ({}): {}",
+                    addr_text(&c.addr),
+                    if c.random { "random" } else { "public" },
+                    c.name.as_deref().map_or_else(|| String::from("a keyboard in pairing mode"), |n| alloc::format!("\"{n}\""))
+                );
+            }
+        }
+    }
+
+    /// Events and data come through different USB pipes, so data the
+    /// keyboard sent after an event can arrive before it. Once a pairing's
+    /// key has gone to the controller, the keyboard's own keys follow the
+    /// encryption at once, and the host stack takes them only after the
+    /// Encryption Change (TrouBLE 0.8 fails the pairing otherwise: seen
+    /// with the emulated keyboard on Nov 15). So data from the pairing
+    /// link is kept back from the encryption's start until the event has
+    /// been passed on. `true`: kept.
+    #[cfg(feature = "pairing")]
+    fn hold_acl(&mut self, packet: &[u8]) -> bool {
+        let Some(link) = self.guard.pairing_start() else { return false };
+        let Some(&[h0, h1]) = packet.first_chunk::<2>() else { return false };
+        if u16::from_le_bytes([h0, h1]) & 0x0FFF != link || self.shared.pairing.link_encrypted.get() == Some(link) {
+            return false;
+        }
+        // Encryption that never comes ends the link; this is only a bound.
+        if self.pairing.held_acl.len() >= 32 {
+            return false;
+        }
+        self.pairing.held_acl.push(packet.to_vec());
+        true
+    }
+
+    /// Pass the kept data on, now that the event it had to follow is in
+    /// the host stack's queue; drop it if the link is gone.
+    #[cfg(feature = "pairing")]
+    fn release_held_acl(&mut self) {
+        if self.pairing.held_acl.is_empty() {
+            return;
+        }
+        match self.guard.pairing_start() {
+            Some(link) if self.shared.pairing.link_encrypted.get() == Some(link) => {
+                info!("pairing: {} data packets had come before the Encryption Change: passed on after it", self.pairing.held_acl.len());
+                for packet in self.pairing.held_acl.drain(..) {
+                    self.inbox.push_acl(&packet);
+                }
+            }
+            Some(_) => {}
+            None => self.pairing.held_acl.clear(),
+        }
+    }
+
+    /// The tick's part of a pairing: accept its result if the tap agrees,
+    /// and (loaded from a shell) show how it is going.
+    #[cfg(feature = "pairing")]
+    fn pairing_tick(&mut self, now: u64) {
+        let shared = self.shared;
+        let p = &shared.pairing;
+        if !p.offered.get() {
+            return;
+        }
+        // A Pairing Failed in either direction, for the session.
+        if p.failed.get().is_none() && self.tap.pairing() {
+            let ours = self.guard.pairing_failed().map(|reason| (true, reason));
+            p.failed.set(ours.or(self.smp_in.pairing_failed.map(|reason| (false, reason))));
+        }
+        let result = p.result.borrow_mut().take();
+        if let Some(new) = result {
+            let accepted = self.accept_pairing(new, now);
+            p.verdict.set(Some(accepted));
+        }
+        if config().is_some_and(|c| c.from_shell) {
+            let stage = p.stage.borrow().clone();
+            if stage != self.pairing.shown {
+                screen::line(&stage);
+                self.pairing.shown = stage;
+            }
+        }
+    }
+
+    /// The host stack reports a pairing that authenticated the device and
+    /// left a bond. It counts if the controller reported this very link
+    /// encrypted after the pairing's key went to it (the tap's word).
+    #[cfg(feature = "pairing")]
+    fn accept_pairing(&mut self, new: pair::NewBond, now: u64) -> bool {
+        let shared = self.shared;
+        if self.tap.conn() != Some(new.handle) || shared.pairing.link_encrypted.get() != Some(new.handle) {
+            error!("pairing: the host stack reports a pairing on a link the controller didn't report encrypted with its key: refused");
+            return false;
+        }
+        if !self.tap.accept_pairing(self.guard, BondKey::new(new.ediv, new.rand, new.ltk)) {
+            error!("pairing: the link isn't a pairing link the controller reported encrypted: refused");
+            return false;
+        }
+        let bond = ExportedBond {
+            peer: new.peer,
+            peer_is_random: new.peer_is_random,
+            adapter: self.adapter,
+            ltk: new.ltk,
+            // BlueZ's key types: authenticated legacy, authenticated P-256.
+            ltk_type: if new.secure_connections { 3 } else { 1 },
+            enc_size: 16,
+            ediv: new.ediv,
+            rand: u64::from_le_bytes(new.rand),
+        };
+        info!(
+            "paired with \"{}\" by passkey ({}): {}",
+            new.name,
+            if new.secure_connections { "LE Secure Connections" } else { "LE legacy pairing" },
+            bond.summary()
+        );
+        if bondstore::store_paired(&bond) {
+            info!("the new bond is stored in a variable the OS can't read; it is used from the next boot on");
+        } else {
+            error!("the new bond couldn't be stored: it works at this boot only");
+        }
+        hand_off_bond(&bond, &mut self.pairing.rng);
+        // The new keyboard, on this very link.
+        shared.keyboard.set(Some((new.peer, new.peer_is_random)));
+        shared.layout.set(None);
+        cache::forget();
+        shared.encrypted.set(Some(new.handle));
+        shared.leds.set(Some(self.keyboard.toggles.led_bits()));
+        self.link = Link { connected_ms: now, keys_flowing: false };
+        self.ever_connected = true;
+        self.pairing.paired = true;
+        let outcome = if new.secure_connections { "paired (Secure Connections)" } else { "paired (LE legacy pairing)" };
+        record::update(|r| {
+            r.pairing = Some(outcome);
+            r.bond = Some("paired at this boot");
+            r.connections += 1;
+            r.first_connection_ms.get_or_insert(now);
+            true
+        });
+        true
     }
 
     fn tap_notification(&mut self, n: &Notification<'_>, now: u64) {
@@ -1275,6 +1685,21 @@ impl Driver {
         app::hand_off(&mut hci, recover);
         hci.stop_event_pipe();
         info!("controller handed back ({} key reports this session)", self.reports);
+        #[cfg(feature = "pairing")]
+        if self.pairing.paired {
+            // The host stack made this boot's pairing keys, and the OS
+            // gets boot services memory as it is: nothing of the stack
+            // runs any more, so its memory is overwritten.
+            drop(hci);
+            self.future = None;
+            for (start, len) in self.pairing.stack_memory {
+                // SAFETY: the two leaked allocations of `start_driver`;
+                // the only code that used them was the future just
+                // dropped.
+                unsafe { uefi_bt::bond::wipe_bytes(core::slice::from_raw_parts_mut(start, len)) };
+            }
+            info!("the host stack's memory was wiped (it held the pairing's keys)");
+        }
     }
 }
 
@@ -1300,6 +1725,114 @@ fn watch_lifecycle() {
     // SAFETY: as above.
     let _ = unsafe { boot::create_event(EventType::SIGNAL_EXIT_BOOT_SERVICES, Tpl::NOTIFY, Some(exit_boot_services), None) };
     register_reset_notify();
+    #[cfg(feature = "pairing")]
+    if config().is_some_and(|c| c.pairing.is_some() && !c.from_shell) {
+        // SAFETY: a notify function with the right signature, no context.
+        let ready = unsafe { boot::create_event_ex(EventType::NOTIFY_SIGNAL, Tpl::CALLBACK, Some(ready_to_boot), None, Some(&READY_TO_BOOT)) };
+        if ready.is_err() {
+            warn!("no ReadyToBoot event group: the boot can't be made to wait for a pairing");
+        }
+    }
+}
+
+/// The boot waited for a pairing already (ReadyToBoot comes once per boot
+/// option tried).
+#[cfg(feature = "pairing")]
+static HELD: AtomicBool = AtomicBool::new(false);
+
+/// The boot manager is about to start a boot option. With pairing on
+/// offer, this is where the boot waits: the screen is up, and whatever is
+/// started next should find the keyboard working.
+#[cfg(feature = "pairing")]
+unsafe extern "efiapi" fn ready_to_boot(_event: Event, _context: Option<NonNull<c_void>>) {
+    if EXITED.load(Ordering::Acquire) || HELD.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    hold_for_pairing();
+    dlog::flush(false);
+}
+
+/// Wait for a pairing: up to the configured time for one to begin, and
+/// then for as long as it is under way (it has limits of its own). The
+/// driver's timer can't fire while this runs at its level, so the tick is
+/// called from here.
+#[cfg(feature = "pairing")]
+fn hold_for_pairing() {
+    use pair::Stage;
+    let Some(cfg) = config() else { return };
+    let Some(why) = cfg.pairing else { return };
+    let Some(shared) = STATE.with(|state| state.as_ref().filter(|d| !d.dead).map(|d| d.shared)) else {
+        info!("pairing: no controller was started, so there is nothing to wait for");
+        return;
+    };
+    let p = &shared.pairing;
+    if p.over.get() {
+        return;
+    }
+    if !screen::available() {
+        warn!("pairing: no console to show a passkey on: not offered at this boot");
+        p.end();
+        return;
+    }
+    // Keys typed before this screen was there (at the firmware's own
+    // prompt, say) don't end the wait.
+    for _ in 0..64 {
+        if !screen::key_pressed() {
+            break;
+        }
+    }
+    let started = clock::now_ms();
+    info!("pairing: the boot waits up to {} s for a keyboard in pairing mode", cfg.pair_wait_ms / 1000);
+    p.go.set(true);
+    let mut deadline = started + cfg.pair_wait_ms;
+    let mut drawn: Option<Stage> = None;
+    let mut shown_s = u64::MAX;
+    let mut leave_at: Option<u64> = None;
+    loop {
+        let alive = STATE.with(|state| match state {
+            Some(d) if !d.dead => {
+                d.tick();
+                !d.dead
+            }
+            _ => false,
+        });
+        dlog::flush(false);
+        if !alive || POWER_OFF.load(Ordering::Acquire) {
+            break;
+        }
+        let now = clock::now_ms();
+        let stage = p.stage.borrow().clone();
+        // A pairing under way is waited for.
+        if p.busy.get() {
+            deadline = deadline.max(now + 3000);
+        }
+        let left = deadline.saturating_sub(now).div_ceil(1000);
+        let ending = matches!(stage, Stage::Paired { .. } | Stage::Over);
+        if drawn.as_ref() != Some(&stage) {
+            screen::draw(&stage, why, (!ending).then_some(left));
+            drawn = Some(stage);
+            shown_s = left;
+        } else if left != shown_s && !ending {
+            screen::countdown(left);
+            shown_s = left;
+        }
+        if ending {
+            // Long enough to be read.
+            match leave_at {
+                None => leave_at = Some(now + 2500),
+                Some(at) if now >= at => break,
+                Some(_) => {}
+            }
+        } else if now >= deadline {
+            info!("pairing: no keyboard was paired in time");
+            p.end();
+        } else if screen::key_pressed() {
+            info!("pairing: a key on another keyboard ended the wait");
+            p.end();
+        }
+        boot::stall(Duration::from_millis(2));
+    }
+    info!("pairing: the boot goes on after {} ms", clock::now_ms() - started);
 }
 
 unsafe extern "efiapi" fn before_exit_boot_services(_event: Event, _context: Option<NonNull<c_void>>) {
@@ -1332,7 +1865,9 @@ fn wipe_secrets() {
     if !cfg.is_null() {
         // SAFETY: the leaked Config; nothing holds a reference into its
         // bond while this runs (the tick is at the same TPL, so not now).
-        unsafe { (*core::ptr::addr_of_mut!((*cfg).bond)).wipe() };
+        if let Some(bond) = unsafe { (*core::ptr::addr_of_mut!((*cfg).bond)).as_mut() } {
+            bond.wipe();
+        }
     }
 }
 

@@ -24,12 +24,26 @@
 //!   the link is encrypted, as before Nov 3. That re-opens a window in which
 //!   a relay or an injector (an unencrypted LE link has no integrity
 //!   protection) can type.
+//!
+//! Pairing in firmware (the driver's `pairing` feature) adds one exception,
+//! and only for one connection at a time:
+//! - **A pairing link.** The driver names the device it is about to pair
+//!   with ([`LinkTap::set_candidate`]). On the connection to that address
+//!   pairing packets pass both ways, and one LE Enable Encryption with a
+//!   key of the host stack's making (the pairing's short-term key or its
+//!   new long-term key) is let through.
+//! - **Encrypted isn't trusted yet.** The controller reporting that
+//!   encryption gives [`TapEvent::PairingEncrypted`], and no keystrokes:
+//!   notifications are still dropped. Only when the driver accepts the
+//!   pairing's result ([`LinkTap::accept_pairing`]: authenticated, bonded)
+//!   does the device become the keyboard, and the guard get its key.
 
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 
 use crate::link::{link_event, LinkEvent, Notification};
 
+const OP_DISCONNECT: u16 = 0x0406;
 const OP_LE_ENABLE_ENCRYPTION: u16 = 0x2019;
 const OP_LE_LTK_REQUEST_REPLY: u16 = 0x201A;
 const CID_SMP: u16 = 0x0006;
@@ -53,6 +67,11 @@ pub struct BondKey {
 impl BondKey {
     pub fn new(ediv: u16, rand: [u8; 8], ltk: [u8; 16]) -> Self {
         Self { ediv, rand, ltk, live: true }
+    }
+
+    /// No bond yet: matches nothing.
+    pub fn none() -> Self {
+        Self { ediv: 0, rand: [0; 8], ltk: [0; 16], live: false }
     }
 
     /// Overwrite the key; nothing matches it afterwards.
@@ -83,6 +102,24 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     core::hint::black_box(diff) == 0
 }
 
+/// Mix `extra` into the answer to LE Rand, if `event` (header included) is
+/// one: a Command Complete for opcode 0x2018 with status 0. The host
+/// stack seeds its random generator from the controller alone (TrouBLE
+/// 0.8: four LE Rand at start-up), and a pairing's passkey, nonces and
+/// key pair come from that seed. XORed with random bytes of the driver's
+/// own, the seed is at least as good as the better of the two sources.
+pub fn mix_le_rand(event: &mut [u8], extra: &[u8; 8]) -> bool {
+    match event {
+        [0x0E, 12, _, 0x18, 0x20, 0x00, random @ ..] if random.len() == 8 => {
+            for (r, x) in random.iter_mut().zip(extra) {
+                *r ^= x;
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
 /// What to do with an HCI command the host stack wants to send.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandCheck {
@@ -90,6 +127,10 @@ pub enum CommandCheck {
     /// LE Enable Encryption with the bonded EDIV and Rand and the stand-in
     /// key, for this connection: sent with the real key in its place.
     BondedEncryption { handle: u16 },
+    /// LE Enable Encryption with anything else: not sent, unless this
+    /// connection is the one a pairing is under way on, and it is the
+    /// pairing's first ([`LinkGuard::allow_pairing`]).
+    OtherEncryption { handle: u16 },
     /// Not sent.
     Refuse(&'static str),
 }
@@ -108,11 +149,7 @@ pub fn check_command(cmd: &[u8], key: &BondKey) -> CommandCheck {
                 & ct_eq(&params[2..10], &key.rand)
                 & ct_eq(&params[10..12], &key.ediv.to_le_bytes())
                 & ct_eq(&params[12..28], &STAND_IN_LTK);
-            if bonded {
-                CommandCheck::BondedEncryption { handle }
-            } else {
-                CommandCheck::Refuse("LE Enable Encryption with a key other than the bonded one")
-            }
+            if bonded { CommandCheck::BondedEncryption { handle } } else { CommandCheck::OtherEncryption { handle } }
         }
         OP_LE_LTK_REQUEST_REPLY => CommandCheck::Refuse("an LE Long Term Key Request Reply (the driver is never a peripheral)"),
         _ => CommandCheck::Pass,
@@ -127,9 +164,34 @@ pub struct SmpFilter {
     /// (`usize::MAX`: until the connection's next start fragment).
     dropping: Option<(u16, usize)>,
     pub dropped: u32,
+    /// The reason of the last Pairing Failed that passed on a pairing
+    /// link ([`SmpFilter::pass_on`]).
+    pub pairing_failed: Option<u8>,
 }
 
 impl SmpFilter {
+    /// As [`SmpFilter::pass`], except that everything passes on `pairing`,
+    /// the connection a pairing is under way on.
+    pub fn pass_on(&mut self, packet: &[u8], pairing: Option<u16>) -> bool {
+        if let (Some(pairing), Some(&[a, b])) = (pairing, packet.first_chunk::<2>()) {
+            if u16::from_le_bytes([a, b]) & 0x0FFF == pairing {
+                if self.dropping.is_some_and(|(h, _)| h == pairing) {
+                    self.dropping = None;
+                }
+                // A start fragment with Pairing Failed (code 5) on the
+                // Security Manager's channel: handle, length, L2CAP
+                // length, channel, code, reason.
+                if let [_, flags, _, _, _, _, 0x06, 0x00, 0x05, reason, ..] = *packet {
+                    if (flags >> 4) & 0b11 != 0b01 {
+                        self.pairing_failed = Some(reason);
+                    }
+                }
+                return true;
+            }
+        }
+        self.pass(packet)
+    }
+
     /// Whether an HCI ACL packet (header included) may pass.
     pub fn pass(&mut self, packet: &[u8]) -> bool {
         let Some((&[a, b, c, d], rest)) = packet.split_first_chunk::<4>() else { return true };
@@ -177,6 +239,12 @@ pub struct LinkGuard {
     key: RefCell<BondKey>,
     /// The connection last given LE Enable Encryption with the bonded key.
     bonded_start: Cell<Option<u16>>,
+    /// The connection a pairing is under way on, if any.
+    pairing: Cell<Option<u16>>,
+    /// ... and it was given LE Enable Encryption with the pairing's key.
+    pairing_start: Cell<Option<u16>>,
+    /// The connection the host stack asked the controller to end.
+    closing: Cell<Option<u16>>,
     smp_out: RefCell<SmpFilter>,
     refused: Cell<u32>,
     last_refusal: Cell<Option<&'static str>>,
@@ -187,47 +255,110 @@ impl LinkGuard {
         Self {
             key: RefCell::new(key),
             bonded_start: Cell::new(None),
+            pairing: Cell::new(None),
+            pairing_start: Cell::new(None),
+            closing: Cell::new(None),
             smp_out: RefCell::new(SmpFilter::default()),
             refused: Cell::new(0),
             last_refusal: Cell::new(None),
         }
     }
 
-    /// For the transport: whether to send this HCI command.
     /// For the transport: whether to send this command. LE Enable
     /// Encryption for the bond gets the real key in place of the stand-in
     /// here; the transport wipes the packet once it's sent.
     pub fn allow_command(&self, cmd: &mut [u8]) -> bool {
+        if let [lo, hi, 3, h0, h1, _reason] = *cmd {
+            if u16::from_le_bytes([lo, hi]) == OP_DISCONNECT {
+                self.closing.set(Some(u16::from_le_bytes([h0, h1]) & 0x0FFF));
+            }
+        }
         let key = self.key.borrow();
-        match check_command(cmd, &key) {
-            CommandCheck::Pass => true,
+        let why = match check_command(cmd, &key) {
+            CommandCheck::Pass => return true,
             CommandCheck::BondedEncryption { handle } => {
                 cmd[15..31].copy_from_slice(&key.ltk);
                 self.bonded_start.set(Some(handle));
-                true
+                return true;
             }
-            CommandCheck::Refuse(why) => {
-                self.refused.set(self.refused.get() + 1);
-                self.last_refusal.set(Some(why));
-                false
+            // A pairing's key, as the host stack made it: once per
+            // pairing link.
+            CommandCheck::OtherEncryption { handle } if self.pairing.get() == Some(handle) && self.pairing_start.get().is_none() => {
+                self.pairing_start.set(Some(handle));
+                return true;
             }
-        }
+            CommandCheck::OtherEncryption { .. } => "LE Enable Encryption with a key other than the bonded one",
+            CommandCheck::Refuse(why) => why,
+        };
+        self.refused.set(self.refused.get() + 1);
+        self.last_refusal.set(Some(why));
+        false
     }
 
     /// For the transport: whether to send this ACL packet.
     pub fn allow_acl(&self, packet: &[u8]) -> bool {
-        self.smp_out.borrow_mut().pass(packet)
+        self.smp_out.borrow_mut().pass_on(packet, self.pairing.get())
     }
 
     pub fn bonded_start(&self) -> Option<u16> {
         self.bonded_start.get()
     }
 
-    /// A connection began or ended: an earlier bonded start for its handle
-    /// no longer counts.
+    /// A pairing is under way on this connection (the tap says so when
+    /// the driver's candidate connects): its pairing packets pass, and one
+    /// LE Enable Encryption with the pairing's key.
+    pub fn allow_pairing(&self, handle: u16) {
+        self.pairing.set(Some(handle));
+        self.pairing_start.set(None);
+        self.smp_out.borrow_mut().pairing_failed = None;
+    }
+
+    /// The host stack told the device that the pairing failed, with this
+    /// reason (as in the Pairing Failed packet). TrouBLE 0.8 doesn't
+    /// always tell its user (seen on Nov 15: a keyboard that only does
+    /// legacy pairing, refused in Secure Connections only mode), so the
+    /// driver reads it off the link.
+    pub fn pairing_failed(&self) -> Option<u8> {
+        self.smp_out.borrow().pairing_failed
+    }
+
+    /// The connection pairing packets pass on.
+    pub fn pairing(&self) -> Option<u16> {
+        self.pairing.get()
+    }
+
+    /// The connection given LE Enable Encryption with a pairing's key.
+    pub fn pairing_start(&self) -> Option<u16> {
+        self.pairing_start.get()
+    }
+
+    /// The connection the host stack has asked the controller to end, until
+    /// it is gone. The host stack has written it off: TrouBLE 0.8 stops
+    /// altogether when an Encryption Change still arrives for it (seen
+    /// with the emulated keyboard on Nov 15), so the driver keeps that
+    /// event to itself.
+    pub fn closing(&self) -> Option<u16> {
+        self.closing.get()
+    }
+
+    /// The bond a pairing ended in: from now on the only key. (The old
+    /// one is wiped as it goes.)
+    pub fn set_key(&self, key: BondKey) {
+        *self.key.borrow_mut() = key;
+    }
+
+    /// A connection began or ended: an earlier bonded start for its
+    /// handle no longer counts, nor does a pairing on it.
     pub fn forget(&self, handle: u16) {
         if self.bonded_start.get() == Some(handle) {
             self.bonded_start.set(None);
+        }
+        if self.pairing.get() == Some(handle) {
+            self.pairing.set(None);
+            self.pairing_start.set(None);
+        }
+        if self.closing.get() == Some(handle) {
+            self.closing.set(None);
         }
     }
 
@@ -260,6 +391,11 @@ pub enum TapEvent {
     /// bonded start: not trusted. Can't happen while the guard is in place.
     Untrusted { handle: u16 },
     EncryptionOff { handle: u16 },
+    /// The device the driver wants to pair with has connected.
+    PairingConnected { handle: u16 },
+    /// That link is encrypted with the key of a pairing. Not trusted for
+    /// keystrokes until [`LinkTap::accept_pairing`].
+    PairingEncrypted { handle: u16, v2: bool },
     /// `dropped`: notifications dropped since the last encryption (all of
     /// them, if the link never was encrypted).
     Disconnected { handle: u16, reason: u8, dropped: u32 },
@@ -298,10 +434,23 @@ struct Stashed {
     encrypted: bool,
 }
 
+/// How far a pairing link has come.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PairingLink {
+    Connected,
+    /// Encrypted with the pairing's key; the driver hasn't accepted the
+    /// pairing yet.
+    Encrypted,
+}
+
 /// The driver's view of the link to the bonded keyboard, from raw HCI.
 pub struct LinkTap {
-    peer: [u8; 6],
-    peer_random: bool,
+    /// The bonded keyboard (address, random); none before a first pairing.
+    peer: Option<([u8; 6], bool)>,
+    /// The device the driver is about to pair with.
+    candidate: Option<([u8; 6], bool)>,
+    /// The current connection is a pairing link.
+    pairing: Option<PairingLink>,
     replay_unencrypted: bool,
     conn: Option<u16>,
     encrypted: bool,
@@ -317,9 +466,16 @@ impl LinkTap {
 
     /// `peer` least significant byte first, as HCI carries it.
     pub fn new(peer: [u8; 6], peer_random: bool, replay_unencrypted: bool) -> Self {
+        Self { peer: Some((peer, peer_random)), ..Self::unpaired(replay_unencrypted) }
+    }
+
+    /// Without a bonded keyboard: nothing is the keyboard's connection
+    /// until a pairing is accepted.
+    pub fn unpaired(replay_unencrypted: bool) -> Self {
         Self {
-            peer,
-            peer_random,
+            peer: None,
+            candidate: None,
+            pairing: None,
             replay_unencrypted,
             conn: None,
             encrypted: false,
@@ -327,6 +483,42 @@ impl LinkTap {
             stash_overflowed: false,
             dropped_unencrypted: 0,
         }
+    }
+
+    /// The bonded keyboard: address (least significant byte first) and
+    /// whether it is a random one.
+    pub fn peer(&self) -> Option<([u8; 6], bool)> {
+        self.peer
+    }
+
+    /// The device the driver is about to connect to and pair with, or
+    /// `None` when it has given that up. A connection to it becomes a
+    /// pairing link, even if it has the bonded keyboard's address.
+    pub fn set_candidate(&mut self, candidate: Option<([u8; 6], bool)>) {
+        self.candidate = candidate;
+    }
+
+    /// The current connection is a pairing link the driver hasn't
+    /// accepted (yet).
+    pub fn pairing(&self) -> bool {
+        self.conn.is_some() && self.pairing.is_some()
+    }
+
+    /// The driver accepts the pairing on the current link: the controller
+    /// reported it encrypted with the pairing's key, and the host stack
+    /// reported a pairing that authenticated the device and left a bond.
+    /// The device is the keyboard from now on, and `key` the only key the
+    /// guard lets an encryption start with. `false`, and nothing changes,
+    /// if the link isn't a pairing link the controller reported encrypted.
+    pub fn accept_pairing(&mut self, guard: &LinkGuard, key: BondKey) -> bool {
+        if self.conn.is_none() || self.pairing != Some(PairingLink::Encrypted) || self.candidate.is_none() {
+            return false;
+        }
+        self.peer = self.candidate.take();
+        self.pairing = None;
+        self.encrypted = true;
+        guard.set_key(key);
+        true
     }
 
     pub fn conn(&self) -> Option<u16> {
@@ -340,6 +532,7 @@ impl LinkTap {
 
     fn reset(&mut self, conn: Option<u16>) {
         self.conn = conn;
+        self.pairing = None;
         self.encrypted = false;
         self.stash.clear();
         self.stash_overflowed = false;
@@ -349,9 +542,16 @@ impl LinkTap {
     /// Feed one HCI event (header included).
     pub fn on_event(&mut self, event: &[u8], guard: &LinkGuard) -> Option<TapEvent> {
         match link_event(event)? {
-            LinkEvent::Connected { handle, peer, peer_random, central }
-                if central && peer == self.peer && peer_random == self.peer_random =>
-            {
+            // The candidate first: a keyboard being paired again has the
+            // bonded address, and its old key is not what this link is for.
+            LinkEvent::Connected { handle, peer, peer_random, central } if central && self.candidate == Some((peer, peer_random)) => {
+                self.reset(Some(handle));
+                self.pairing = Some(PairingLink::Connected);
+                guard.forget(handle);
+                guard.allow_pairing(handle);
+                Some(TapEvent::PairingConnected { handle })
+            }
+            LinkEvent::Connected { handle, peer, peer_random, central } if central && self.peer == Some((peer, peer_random)) => {
                 self.reset(Some(handle));
                 guard.forget(handle);
                 Some(TapEvent::Connected { handle })
@@ -363,12 +563,20 @@ impl LinkTap {
                     self.encrypted = false;
                     return Some(TapEvent::EncryptionOff { handle });
                 }
-                if guard.bonded_start() != Some(handle) {
-                    self.encrypted = false;
-                    return Some(TapEvent::Untrusted { handle });
+                match self.pairing {
+                    Some(PairingLink::Connected) if guard.pairing_start() == Some(handle) => {
+                        self.pairing = Some(PairingLink::Encrypted);
+                        Some(TapEvent::PairingEncrypted { handle, v2 })
+                    }
+                    None if guard.bonded_start() == Some(handle) => {
+                        self.encrypted = true;
+                        Some(TapEvent::Encrypted { handle, v2, dropped: core::mem::take(&mut self.dropped_unencrypted) })
+                    }
+                    _ => {
+                        self.encrypted = false;
+                        Some(TapEvent::Untrusted { handle })
+                    }
                 }
-                self.encrypted = true;
-                Some(TapEvent::Encrypted { handle, v2, dropped: core::mem::take(&mut self.dropped_unencrypted) })
             }
             LinkEvent::Disconnected { handle, reason } if Some(handle) == self.conn => {
                 let dropped = self.dropped_unencrypted;
@@ -518,12 +726,19 @@ mod tests {
         let stk = BondKey::new(0, [0; 8], [0x55; 16]);
         let other_ediv = BondKey::new(0x1235, [1, 2, 3, 4, 5, 6, 7, 8], [0x0F; 16]);
         let other_rand = BondKey::new(0x1234, [1, 2, 3, 4, 5, 6, 7, 9], [0x0F; 16]);
+        let guard = LinkGuard::new(key());
         for wrong in [stk, other_ediv, other_rand] {
-            assert!(matches!(check_command(&enable_encryption(H, &wrong), &k), CommandCheck::Refuse(_)));
+            assert_eq!(check_command(&enable_encryption(H, &wrong), &k), CommandCheck::OtherEncryption { handle: H });
+            assert!(!guard.allow_command(&mut enable_encryption(H, &wrong)));
         }
         for ltk in [k.ltk, [0x0E; 16], [0; 16]] {
-            assert!(matches!(check_command(&enable_encryption_with(H, &k, &ltk), &k), CommandCheck::Refuse(_)));
+            assert_eq!(check_command(&enable_encryption_with(H, &k, &ltk), &k), CommandCheck::OtherEncryption { handle: H });
+            assert!(!guard.allow_command(&mut enable_encryption_with(H, &k, &ltk)));
         }
+        assert_eq!(guard.refused(), (6, Some("LE Enable Encryption with a key other than the bonded one")));
+        // Without a bond nothing counts as the bonded key, not even zeros.
+        let none = BondKey::none();
+        assert_eq!(check_command(&enable_encryption(H, &BondKey::new(0, [0; 8], [0; 16])), &none), CommandCheck::OtherEncryption { handle: H });
         // Truncated; peripheral-side LTK reply; anything else passes.
         assert!(matches!(check_command(&enable_encryption(H, &k)[..20], &k), CommandCheck::Refuse(_)));
         assert!(matches!(check_command(&[0x1A, 0x20, 0x12, 0, 0], &k), CommandCheck::Refuse(_)));
@@ -661,6 +876,168 @@ mod tests {
         assert_eq!(replay.reports.iter().map(|(_, value)| value[1]).collect::<alloc::vec::Vec<_>>(), [0x04, 0x05, 0x28]);
         // With nothing kept, reports are delivered as they come.
         assert_eq!(tap.on_notification(&notification(&c).unwrap(), true), Verdict::Deliver);
+    }
+
+    /// A Pairing Request (channel 6) on connection `handle`.
+    fn smp_packet(handle: u16) -> Vec<u8> {
+        let [lo, hi] = (handle | 0x2000).to_le_bytes();
+        vec![lo, hi, 0x0B, 0x00, 0x07, 0x00, 0x06, 0x00, 0x01, 0x00, 0x00, 0x0D, 0x10, 0x03, 0x03]
+    }
+
+    /// Another device: C0:00:00:00:00:77, random static.
+    const OTHER: [u8; 6] = [0x77, 0x00, 0x00, 0x00, 0x00, 0xC0];
+
+    #[test]
+    fn a_pairing_link_is_trusted_only_once_accepted() {
+        let guard = LinkGuard::new(BondKey::none());
+        let mut tap = LinkTap::unpaired(false);
+        // Nobody is the keyboard yet: a connection is nothing to the tap,
+        // pairing packets don't pass, no encryption starts.
+        assert_eq!(tap.on_event(&connected(H, 0, 1, OTHER), &guard), None);
+        assert!(!guard.allow_acl(&smp_packet(H)));
+        let stk = BondKey::new(0, [0; 8], [0x55; 16]);
+        assert!(!guard.allow_command(&mut enable_encryption_with(H, &stk, &[0x55; 16])));
+        assert_eq!(tap.on_event(&disconnected(H, 0x13), &guard), None);
+
+        // The driver picks a candidate; its connection is a pairing link.
+        tap.set_candidate(Some((OTHER, true)));
+        assert_eq!(tap.on_event(&connected(H, 0, 1, OTHER), &guard), Some(TapEvent::PairingConnected { handle: H }));
+        assert!(tap.pairing() && !tap.encrypted());
+        assert_eq!(guard.pairing(), Some(H));
+        // Pairing packets pass on it, and only on it.
+        assert!(guard.allow_acl(&smp_packet(H)));
+        assert!(!guard.allow_acl(&smp_packet(H + 1)));
+        // A Pairing Failed from the host stack is noticed as it passes.
+        assert_eq!(guard.pairing_failed(), None);
+        let [lo, hi] = (H | 0x2000).to_le_bytes();
+        assert!(guard.allow_acl(&[lo, hi, 0x06, 0x00, 0x02, 0x00, 0x06, 0x00, 0x05, 0x03]));
+        assert_eq!(guard.pairing_failed(), Some(0x03));
+        guard.allow_pairing(H);
+        assert_eq!(guard.pairing_failed(), None);
+        // An encryption the driver didn't start isn't the pairing's.
+        assert_eq!(tap.on_event(&enc_change(0, H, 1), &guard), Some(TapEvent::Untrusted { handle: H }));
+        // The pairing's key goes through as the host stack made it, once.
+        let mut cmd = enable_encryption_with(H, &stk, &[0x55; 16]);
+        assert!(guard.allow_command(&mut cmd));
+        assert_eq!(&cmd[15..31], &[0x55; 16]);
+        assert!(!guard.allow_command(&mut enable_encryption_with(H, &stk, &[0x56; 16])));
+        assert_eq!(tap.on_event(&enc_change_v2(0, H, 1), &guard), Some(TapEvent::PairingEncrypted { handle: H, v2: true }));
+        // Encrypted, but not trusted: reports are dropped.
+        assert!(!tap.encrypted());
+        let r = report(H, 0x04);
+        assert_eq!(tap.on_notification(&notification(&r).unwrap(), true), Verdict::DroppedUnencrypted);
+        // The driver accepts the pairing: the device is the keyboard now,
+        // and its bond the guard's key.
+        assert!(tap.accept_pairing(&guard, key()));
+        assert!(tap.encrypted() && !tap.pairing());
+        assert_eq!(tap.peer(), Some((OTHER, true)));
+        assert_eq!(tap.on_notification(&notification(&r).unwrap(), true), Verdict::Deliver);
+        // Pairing packets still pass until the link ends (the host stack's
+        // own keys may be on their way), but no second pairing key.
+        assert!(guard.allow_acl(&smp_packet(H)));
+        assert!(!guard.allow_command(&mut enable_encryption_with(H, &stk, &[0x57; 16])));
+        assert_eq!(tap.on_event(&disconnected(H, 0x13), &guard), Some(TapEvent::Disconnected { handle: H, reason: 0x13, dropped: 1 }));
+        assert_eq!(guard.pairing(), None);
+        assert!(!guard.allow_acl(&smp_packet(H)));
+
+        // From here on it is a bonded keyboard like any other.
+        assert_eq!(tap.on_event(&connected(H, 0, 1, OTHER), &guard), Some(TapEvent::Connected { handle: H }));
+        assert!(!guard.allow_acl(&smp_packet(H)));
+        assert!(guard.allow_command(&mut enable_encryption(H, &key())));
+        assert_eq!(tap.on_event(&enc_change(0, H, 1), &guard), Some(TapEvent::Encrypted { handle: H, v2: false, dropped: 0 }));
+    }
+
+    #[test]
+    fn a_pairing_that_isnt_accepted_leaves_nothing() {
+        let guard = LinkGuard::new(BondKey::none());
+        let mut tap = LinkTap::unpaired(false);
+        tap.set_candidate(Some((OTHER, true)));
+        // Accepting needs the controller's word that the link is encrypted
+        // with the pairing's key.
+        assert!(!tap.accept_pairing(&guard, key()));
+        tap.on_event(&connected(H, 0, 1, OTHER), &guard);
+        assert!(!tap.accept_pairing(&guard, key()));
+        let stk = BondKey::new(0, [0; 8], [0x55; 16]);
+        assert!(guard.allow_command(&mut enable_encryption_with(H, &stk, &[0x55; 16])));
+        // Encryption failed (the device didn't have the key it claimed).
+        assert_eq!(tap.on_event(&enc_change(0x06, H, 0), &guard), None);
+        assert!(!tap.accept_pairing(&guard, key()));
+        assert_eq!(tap.on_event(&disconnected(H, 0x3D), &guard), Some(TapEvent::Disconnected { handle: H, reason: 0x3D, dropped: 0 }));
+        assert_eq!(tap.peer(), None);
+        // The driver gives the candidate up: it is nobody again.
+        tap.set_candidate(None);
+        assert_eq!(tap.on_event(&connected(H, 0, 1, OTHER), &guard), None);
+        assert!(!guard.allow_acl(&smp_packet(H)));
+        // And the guard still has no key.
+        assert!(!guard.allow_command(&mut enable_encryption(H, &key())));
+    }
+
+    #[test]
+    fn pairing_a_bonded_keyboard_again_doesnt_use_its_old_key() {
+        let (mut tap, guard) = ready(false);
+        tap.on_event(&disconnected(H, 0x13), &guard);
+        // The same address, now as the candidate: a pairing link.
+        tap.set_candidate(Some((PEER, true)));
+        assert_eq!(tap.on_event(&connected(H, 0, 1, PEER), &guard), Some(TapEvent::PairingConnected { handle: H }));
+        // The old key on this link isn't the pairing's key, so its
+        // encryption isn't trusted.
+        assert!(guard.allow_command(&mut enable_encryption(H, &key())));
+        assert_eq!(tap.on_event(&enc_change(0, H, 1), &guard), Some(TapEvent::Untrusted { handle: H }));
+        assert!(!tap.encrypted());
+        // Given up: the old bond works as before.
+        tap.on_event(&disconnected(H, 0x16), &guard);
+        tap.set_candidate(None);
+        assert_eq!(tap.on_event(&connected(H, 0, 1, PEER), &guard), Some(TapEvent::Connected { handle: H }));
+        assert!(guard.allow_command(&mut enable_encryption(H, &key())));
+        assert_eq!(tap.on_event(&enc_change(0, H, 1), &guard), Some(TapEvent::Encrypted { handle: H, v2: false, dropped: 0 }));
+    }
+
+    #[test]
+    fn pairing_packets_pass_whole_on_the_pairing_link() {
+        let mut f = SmpFilter::default();
+        // A Pairing Public Key in three fragments on the pairing link.
+        let mut start = vec![0x00, 0x22, 0x1B, 0x00, 0x41, 0x00, 0x06, 0x00, 0x0C];
+        start.extend_from_slice(&[0xAA; 22]);
+        let mut cont = vec![0x00, 0x12, 0x1B, 0x00];
+        cont.extend_from_slice(&[0xBB; 27]);
+        assert!(f.pass_on(&start, Some(H)));
+        assert!(f.pass_on(&cont, Some(H)));
+        // On another connection it is dropped as ever.
+        assert!(!f.pass_on(&start, Some(H + 1)));
+        assert!(!f.pass_on(&cont, Some(H + 1)));
+        assert_eq!(f.dropped, 1);
+    }
+
+    #[test]
+    fn the_guard_knows_which_connection_is_being_closed() {
+        let guard = LinkGuard::new(key());
+        assert_eq!(guard.closing(), None);
+        // HCI_Disconnect for 0x0200, reason 0x13: passes, and is noted.
+        assert!(guard.allow_command(&mut [0x06, 0x04, 0x03, 0x00, 0x02, 0x13]));
+        assert_eq!(guard.closing(), Some(H));
+        // Until the connection is gone (the tap forgets its handle then).
+        guard.forget(H + 1);
+        assert_eq!(guard.closing(), Some(H));
+        guard.forget(H);
+        assert_eq!(guard.closing(), None);
+    }
+
+    #[test]
+    fn le_rand_answers_get_the_drivers_randomness_too() {
+        let extra = [0xF0, 0x0F, 0xFF, 0x00, 0x01, 0x02, 0x04, 0x08];
+        let mut e = vec![0x0E, 12, 1, 0x18, 0x20, 0x00, 1, 2, 3, 4, 5, 6, 7, 8];
+        assert!(mix_le_rand(&mut e, &extra));
+        assert_eq!(e, [0x0E, 12, 1, 0x18, 0x20, 0x00, 0xF1, 0x0D, 0xFC, 4, 4, 4, 3, 0]);
+        // A failed LE Rand, another command's answer, a short event: as is.
+        for other in [
+            vec![0x0E, 12, 1, 0x18, 0x20, 0x0C, 1, 2, 3, 4, 5, 6, 7, 8],
+            vec![0x0E, 12, 1, 0x09, 0x10, 0x00, 1, 2, 3, 4, 5, 6, 7, 8],
+            vec![0x0E, 4, 1, 0x18, 0x20, 0x00],
+        ] {
+            let mut e = other.clone();
+            assert!(!mix_le_rand(&mut e, &extra));
+            assert_eq!(e, other);
+        }
     }
 
     #[test]

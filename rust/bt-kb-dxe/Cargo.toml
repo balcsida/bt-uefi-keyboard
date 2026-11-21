@@ -12,6 +12,17 @@ build = "build.rs"
 # integrity protection, so anyone in radio range could inject those. For
 # experiments only; never in a build you install (see README, Security).
 insecure-replay-unencrypted = []
+# Pairing in firmware: with no keyboard paired (or when bt-kb-dxe.pair asks
+# for it), the driver looks for a keyboard in pairing mode at boot, shows a
+# passkey and pairs, with LE Secure Connections only. A bond made this way
+# can't be pinned by the build: it is trusted because only pre-boot code
+# can have stored it (see README, Security).
+pairing = []
+# ... and with LE legacy pairing too, for keyboards that can't do Secure
+# Connections. Insecure against anyone in radio range while pairing is on
+# offer: with legacy pairing the passkey proves nothing to the PC, so
+# somebody else's device can pair in the keyboard's place and type.
+insecure-legacy-pairing = ["pairing"]
 
 [dependencies]
 mtk-bt = { path = "../mtk-bt" }
