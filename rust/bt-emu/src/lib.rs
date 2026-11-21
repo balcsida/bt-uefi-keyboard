@@ -14,6 +14,8 @@
 //!   keyboard's behaviour (advertising when woken, key reports only on an
 //!   encrypted link, its parameter request, its idle disconnect).
 //! - [`gatt`]: the keyboard's attribute table and ATT server.
+//! - [`smp`]: the keyboard's side of pairing (legacy and Secure
+//!   Connections), for the tests of pairing in firmware.
 //! - [`usbdev`]: descriptors, MediaTek's vendor channel, the HCI pipes.
 //! - [`usbredir`]: the wire protocol to QEMU.
 
@@ -21,6 +23,7 @@ pub mod gatt;
 pub mod log;
 pub mod radio;
 pub mod script;
+pub mod smp;
 pub mod usbdev;
 pub mod usbredir;
 

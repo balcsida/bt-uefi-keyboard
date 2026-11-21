@@ -16,3 +16,13 @@ version = "0.1.0"
 opt-level = "s"
 lto = true
 codegen-units = 1
+
+# bt-emu is a debug build, and its "impostor" (bt-emu/src/smp.rs) tries up
+# to a million passkeys, two AES operations each, while QEMU waits for the
+# emulated controller: unoptimized that took two seconds, and the driver's
+# USB transfers timed out (Nov 15).
+[profile.dev.package.aes]
+opt-level = 3
+
+[profile.dev.package.bt-emu]
+opt-level = 2

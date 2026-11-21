@@ -2,7 +2,8 @@
 //! `usb-redir` device connects to.
 //!
 //! ```text
-//! bt-emu --socket PATH [--bond FILE] [--script FILE] [--log FILE] [--quiet] [--timeout SECONDS]
+//! bt-emu --socket PATH [--bond FILE] [--state FILE] [--script FILE] [--screen FILE] [--log FILE] [--quiet]
+//!        [--timeout SECONDS]
 //!
 //! qemu ... -chardev socket,id=emu,path=PATH -device usb-redir,chardev=emu
 //! ```
@@ -10,9 +11,16 @@
 //! `--bond`: a bond file as `scripts/export-bond.sh` writes it. It gives
 //! the controller's address, the keyboard's address, and the key the
 //! keyboard holds for this host. Without it the keyboard has no bond.
+//! `--state`: where the keyboard keeps its bond between runs, so that a
+//! pairing made in one boot of the guest is still there at the next. If
+//! the file exists, the bond in it (or its absence) replaces the one of
+//! `--bond`; it is rewritten whenever the keyboard's bond changes.
 //! `--script`: what the keyboard's user does (see `script.rs`). The
 //! program ends when QEMU closes the connection, and exits with 1 if a
 //! step of the script failed.
+//! `--screen`: the file QEMU writes the guest's serial console to, for the
+//! script's `read-passkey` (the keyboard's user reads the passkey off the
+//! PC's screen).
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixListener;
@@ -31,14 +39,16 @@ use bt_emu::{log, note};
 struct Args {
     socket: Option<PathBuf>,
     bond: Option<PathBuf>,
+    state: Option<PathBuf>,
     script: Option<PathBuf>,
+    screen: Option<PathBuf>,
     log: Option<PathBuf>,
     quiet: bool,
     timeout_s: Option<u64>,
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage: bt-emu --socket PATH [--bond FILE] [--script FILE] [--log FILE] [--quiet] [--timeout SECONDS]");
+    eprintln!("usage: bt-emu --socket PATH [--bond FILE] [--state FILE] [--script FILE] [--screen FILE] [--log FILE] [--quiet] [--timeout SECONDS]");
     ExitCode::from(2)
 }
 
@@ -49,10 +59,12 @@ fn parse_args() -> Option<Args> {
         match arg.as_str() {
             "--socket" => args.socket = Some(it.next()?.into()),
             "--bond" => args.bond = Some(it.next()?.into()),
+            "--state" => args.state = Some(it.next()?.into()),
             "--script" => args.script = Some(it.next()?.into()),
             "--log" => args.log = Some(it.next()?.into()),
             "--quiet" => args.quiet = true,
             "--timeout" => args.timeout_s = Some(it.next()?.parse().ok()?),
+            "--screen" => args.screen = Some(it.next()?.into()),
             _ => return None,
         }
     }
@@ -71,13 +83,17 @@ fn config_from_bond(text: &str) -> Result<Config, String> {
 }
 
 fn run(args: Args) -> Result<bool, String> {
-    let cfg = match &args.bond {
+    let mut cfg = match &args.bond {
         Some(path) => {
             let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
             config_from_bond(&text).map_err(|e| format!("{}: {e}", path.display()))?
         }
         None => Config::default(),
     };
+    if let Some(text) = args.state.as_ref().and_then(|path| std::fs::read_to_string(path).ok()) {
+        cfg.bond = Bond::from_text(&text).map_err(|e| format!("{}: {e}", args.state.as_ref().unwrap().display()))?;
+    }
+    let mut saved_bond = cfg.bond;
     let steps = match &args.script {
         Some(path) => {
             let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -85,7 +101,7 @@ fn run(args: Args) -> Result<bool, String> {
         }
         None => Vec::new(),
     };
-    let mut script = Script::new(steps);
+    let mut script = Script::new(steps).with_screen(args.screen.clone());
     let mut radio = Radio::new(cfg);
     let mut dev = UsbDev::new();
 
@@ -168,6 +184,14 @@ fn run(args: Args) -> Result<bool, String> {
             }
         }
         script_wake = script.run(now, &mut radio, &mut dev);
+        if radio.cfg.bond != saved_bond {
+            saved_bond = radio.cfg.bond;
+            if let Some(path) = &args.state {
+                if let Err(e) = std::fs::write(path, Bond::to_text(&saved_bond)) {
+                    note!("bt-emu: writing {} failed: {e}", path.display());
+                }
+            }
+        }
         // What the script or the host just started may be due at once.
         radio.advance(now);
         for event in radio.events.drain(..) {

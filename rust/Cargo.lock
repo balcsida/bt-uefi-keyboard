@@ -44,7 +44,10 @@ dependencies = [
 name = "bt-emu"
 version = "0.1.0"
 dependencies = [
+ "aes",
+ "cmac",
  "mtk-bt",
+ "p256",
  "uefi-bt",
 ]
 

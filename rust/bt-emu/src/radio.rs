@@ -10,6 +10,13 @@
 //!   service and the keyboard appearance; its name comes in the scan
 //!   response. In pairing mode it is undirected from the start, and says
 //!   it is discoverable.
+//! - **Pairing** ([`crate::smp`]): only in pairing mode, which forgets the
+//!   host it was bonded to (an assumption: the real keyboard was never put
+//!   into pairing mode here, since that would have cost its bond). The
+//!   user types the passkey the host shows. The link then counts as
+//!   encrypted when the host names the pairing's key in LE Enable
+//!   Encryption, and the keyboard remembers the new bond once the keys
+//!   are exchanged. A new host finds its notifications off.
 //! - **Encryption with the bond it has for this host.** LE Enable
 //!   Encryption with the right EDIV, Rand and key turns it on. A key the
 //!   keyboard doesn't know gives "PIN or key missing" (0x06). The right
@@ -30,6 +37,7 @@ use std::collections::VecDeque;
 
 use crate::gatt::{self, AttServer};
 use crate::note;
+use crate::smp::{Ends, Smp};
 
 /// The handle the MT7922 gives its first LE link.
 pub const HANDLE: u16 = 0x0200;
@@ -55,6 +63,30 @@ pub struct Bond {
     pub ediv: u16,
     pub rand: [u8; 8],
     pub ltk: [u8; 16],
+}
+
+impl Bond {
+    /// A bond, or the lack of one, as the emulator's state file has it:
+    /// `none`, or EDIV, Rand and the key in hex.
+    pub fn to_text(bond: &Option<Bond>) -> String {
+        let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        match bond {
+            None => String::from("none\n"),
+            Some(b) => format!("{:04x} {} {}\n", b.ediv, hex(&b.rand), hex(&b.ltk)),
+        }
+    }
+
+    pub fn from_text(text: &str) -> Result<Option<Bond>, String> {
+        let bytes = |hex: &str| -> Option<Vec<u8>> { (0..hex.len() / 2).map(|i| u8::from_str_radix(hex.get(2 * i..2 * i + 2)?, 16).ok()).collect() };
+        match text.split_whitespace().collect::<Vec<_>>().as_slice() {
+            ["none"] => Ok(None),
+            [ediv, rand, ltk] => (|| {
+                Some(Some(Bond { ediv: u16::from_str_radix(ediv, 16).ok()?, rand: bytes(rand)?.try_into().ok()?, ltk: bytes(ltk)?.try_into().ok()? }))
+            })()
+            .ok_or_else(|| String::from("not a bond")),
+            _ => Err(String::from("not a bond")),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +116,11 @@ pub struct Config {
     /// Report encryption with version 1 of the event even if the host
     /// unmasked version 2 (controllers older than Bluetooth 5.3).
     pub encryption_change_v1: bool,
+    /// From the encryption of a pairing link to the keyboard's keys: they
+    /// go out in its next connection events. With 0 they reach the host
+    /// together with the Encryption Change, and may overtake it, since
+    /// events and data travel through different USB pipes.
+    pub pairing_keys_delay_ms: u64,
 }
 
 impl Default for Config {
@@ -103,6 +140,7 @@ impl Default for Config {
             battery_after_ms: Some(2500),
             supervision_ms: 2000,
             encryption_change_v1: false,
+            pairing_keys_delay_ms: 15,
         }
     }
 }
@@ -136,6 +174,8 @@ pub struct Facts {
 
 struct Link {
     encrypted: bool,
+    /// The host's address type on this link: 0 public, 1 random.
+    host_type: u8,
     interval: u16,
     latency: u16,
     timeout: u16,
@@ -145,6 +185,7 @@ struct Initiating {
     use_accept_list: bool,
     peer_type: u8,
     peer: [u8; 6],
+    own_type: u8,
     interval: u16,
     latency: u16,
     timeout: u16,
@@ -161,6 +202,7 @@ enum Timer {
     Battery,
     Pump,
     AdvReport,
+    PairingKeys,
 }
 
 impl Timer {
@@ -205,6 +247,12 @@ pub struct Radio {
     /// HCI ACL packets for the host.
     pub acl: VecDeque<Vec<u8>>,
     pub att: AttServer,
+    /// The keyboard's side of pairing.
+    pub smp: Smp,
+    /// Pairings whose bond the keyboard has taken over.
+    pairings_applied: u32,
+    /// What LE Set Random Address last set.
+    random_addr: [u8; 6],
     now: u64,
     timers: Vec<(u64, Timer)>,
     // The controller.
@@ -258,6 +306,9 @@ impl Radio {
             events: VecDeque::new(),
             acl: VecDeque::new(),
             att,
+            smp: Smp::new(Default::default()),
+            pairings_applied: 0,
+            random_addr: [0; 6],
             now: 0,
             timers: Vec::new(),
             event_mask: DEFAULT_EVENT_MASK,
@@ -531,7 +582,10 @@ impl Radio {
             // LE Read Local Supported Features: LE Encryption.
             (0x2003, 0) => self.complete(opcode, &[0, 0x01, 0, 0, 0, 0, 0, 0, 0]),
             // LE Set Random Address.
-            (0x2005, 6) => self.complete(opcode, &[0]),
+            (0x2005, 6) => {
+                self.random_addr.copy_from_slice(p);
+                self.complete(opcode, &[0]);
+            }
             // LE Set Scan Parameters: type (1: active), interval, window,
             // own address type, filter policy.
             (0x200B, 7) => {
@@ -561,6 +615,7 @@ impl Radio {
                     use_accept_list: p[4] == 1,
                     peer_type: p[5],
                     peer,
+                    own_type: p[12] & 1,
                     interval: u16_at(13),
                     latency: u16_at(17),
                     timeout: u16_at(19),
@@ -714,16 +769,63 @@ impl Radio {
     /// The keyboard's pairing button: it becomes discoverable and takes a
     /// connection from any host.
     pub fn enter_pairing_mode(&mut self) {
-        note!("kbd: pairing button pressed");
+        note!("kbd: pairing button pressed{}", if self.cfg.bond.is_some() { ": the old bond is forgotten" } else { "" });
+        self.set_bond(None);
         self.pairing_mode = true;
         self.advertising = false;
         self.start_advertising();
     }
 
+    pub fn in_pairing_mode(&self) -> bool {
+        self.pairing_mode
+    }
+
+    /// The two addresses of the link, as pairing uses them.
+    fn ends(&self) -> Ends {
+        let host_type = self.link.as_ref().map_or(0, |l| l.host_type);
+        Ends {
+            host_type,
+            host: if host_type == 0 { self.cfg.bd_addr } else { self.random_addr },
+            kbd_type: self.kbd_address_type(),
+            kbd: self.cfg.kbd_addr,
+        }
+    }
+
+    /// Send what the pairing has for the host, and take over the bond of
+    /// one that has just completed. The new host's notifications stay off
+    /// until it switches them on.
+    fn after_smp(&mut self) {
+        for pdu in core::mem::take(&mut self.smp.out) {
+            self.to_host(CID_SMP, &pdu);
+        }
+        if self.smp.completed > self.pairings_applied {
+            self.pairings_applied = self.smp.completed;
+            if let Some(bond) = self.smp.take_bond() {
+                self.cfg.bond = Some(bond);
+            }
+            self.pairing_mode = false;
+            self.last_activity = self.now;
+        }
+    }
+
+    /// The user types the passkey the host shows, and Enter.
+    pub fn type_passkey(&mut self, passkey: u32) {
+        let ends = self.ends();
+        self.smp.enter_passkey(passkey, &ends);
+        self.after_smp();
+        self.last_activity = self.now;
+    }
+
     fn drop_link(&mut self) {
         self.link = None;
+        self.smp.reset();
         self.reassembly = None;
         self.disarm(Timer::of_link);
+        // Pairing mode lasts until a host has paired: the keyboard is
+        // discoverable again.
+        if self.pairing_mode {
+            self.start_advertising();
+        }
     }
 
     /// The keyboard ends the link.
@@ -746,7 +848,7 @@ impl Radio {
                 }
                 let Some(i) = self.initiating.take() else { return };
                 self.advertising = false;
-                let link = Link { encrypted: false, interval: i.interval, latency: i.latency, timeout: i.timeout };
+                let link = Link { encrypted: false, host_type: i.own_type, interval: i.interval, latency: i.latency, timeout: i.timeout };
                 note!("link: connected (handle {HANDLE:#06x}, interval {} x 1.25 ms)", link.interval);
                 self.facts.connections += 1;
                 self.connection_complete(0, Some(&link));
@@ -762,6 +864,28 @@ impl Radio {
             }
             Timer::Encrypt { rand, ediv, ltk } => {
                 if self.link.is_none() {
+                    return;
+                }
+                // A pairing has just agreed on a key: the host starts
+                // encryption with it, and with EDIV and Rand zero.
+                if let Some(key) = self.smp.link_key() {
+                    if ediv == 0 && rand == [0; 8] && ltk == key {
+                        note!("link: encrypted with the key of the pairing");
+                        self.facts.encryptions += 1;
+                        self.link.as_mut().unwrap().encrypted = true;
+                        self.encryption_change(0, true);
+                        if self.cfg.pairing_keys_delay_ms == 0 {
+                            self.fire(Timer::PairingKeys);
+                        } else {
+                            self.arm(self.now + self.cfg.pairing_keys_delay_ms, Timer::PairingKeys);
+                        }
+                    } else {
+                        note!("link: the host's key isn't the one the pairing agreed on: MIC failure, link lost");
+                        self.facts.mic_failures += 1;
+                        self.drop_link();
+                        self.disconnection_complete(REASON_MIC_FAILURE);
+                    }
+                    self.pump();
                     return;
                 }
                 match self.cfg.bond {
@@ -828,6 +952,11 @@ impl Radio {
                 }
             }
             Timer::Pump => self.pump(),
+            Timer::PairingKeys => {
+                let ends = self.ends();
+                self.smp.encrypted(&ends);
+                self.after_smp();
+            }
             Timer::AdvReport => {
                 if self.scan.is_none() {
                     return;
@@ -977,6 +1106,9 @@ impl Radio {
             CID_SMP => {
                 self.facts.smp_from_host += 1;
                 note!("smp: the host sent code {:#04x} ({} bytes)", payload.first().copied().unwrap_or(0), payload.len());
+                let ends = self.ends();
+                self.smp.from_host(payload, self.pairing_mode, &ends);
+                self.after_smp();
             }
             other => note!("l2cap: {} bytes on channel {other:#06x} from the host: ignored", payload.len()),
         }
@@ -1480,6 +1612,129 @@ mod tests {
         packet.extend_from_slice(&[11, 0, 7, 0, 0x06, 0x00, 0x01, 0x03, 0x00, 0x01, 0x10, 0x07, 0x07]);
         r.acl_from_host(&packet);
         assert_eq!(r.facts.smp_from_host, 1);
+        // The keyboard isn't in pairing mode: Pairing Failed, "pairing
+        // not supported". Its bond stays.
+        assert_eq!(smp_out(&mut r), [vec![0x05, 0x05]]);
+        assert_eq!(r.cfg.bond, Some(BOND));
+    }
+
+    fn smp(r: &mut Radio, pdu: &[u8]) {
+        let mut packet = HANDLE.to_le_bytes().to_vec();
+        packet.extend_from_slice(&(pdu.len() as u16 + 4).to_le_bytes());
+        packet.extend_from_slice(&(pdu.len() as u16).to_le_bytes());
+        packet.extend_from_slice(&CID_SMP.to_le_bytes());
+        packet.extend_from_slice(pdu);
+        r.acl_from_host(&packet);
+    }
+
+    /// The Security Manager PDUs waiting for the host.
+    fn smp_out(r: &mut Radio) -> Vec<Vec<u8>> {
+        let out = r.acl.iter().filter(|p| p[6..8] == CID_SMP.to_le_bytes()).map(|p| p[8..].to_vec()).collect();
+        r.acl.clear();
+        out
+    }
+
+    #[test]
+    fn a_host_pairs_and_comes_back_with_the_new_bond() {
+        use crate::smp::{c1, s1, LegacyInputs};
+        let mut r = radio();
+        init(&mut r);
+        // The pairing button: the old bond is gone, and with it the
+        // notifications its host had switched on.
+        r.enter_pairing_mode();
+        assert!(r.cfg.bond.is_none() && r.in_pairing_mode());
+        assert!(!r.att.notifying(gatt::H_KEYS_CCCD));
+        create_connection(&mut r);
+        r.advance(100);
+        assert!(r.is_connected());
+        r.acl.clear();
+        // Legacy passkey entry, the host showing 424242.
+        let preq = [0x01, 0x00, 0x00, 0x0D, 16, 0x03, 0x03];
+        smp(&mut r, &preq);
+        let pres: [u8; 7] = smp_out(&mut r)[0].clone().try_into().unwrap();
+        assert_eq!(pres, [0x02, 0x02, 0x00, 0x05, 16, 0x03, 0x03]);
+        let inputs = LegacyInputs { preq, pres, initiator_type: 0, initiator: r.cfg.bd_addr, responder_type: 1, responder: r.cfg.kbd_addr };
+        let mut tk = [0u8; 16];
+        tk[..4].copy_from_slice(&424_242u32.to_le_bytes());
+        let mrand = [0x11; 16];
+        let mut confirm = vec![0x03];
+        confirm.extend_from_slice(&c1(&tk, &mrand, &inputs));
+        smp(&mut r, &confirm);
+        assert!(smp_out(&mut r).is_empty());
+        r.type_passkey(424_242);
+        let sconfirm: [u8; 16] = smp_out(&mut r)[0][1..].try_into().unwrap();
+        let mut random = vec![0x04];
+        random.extend_from_slice(&mrand);
+        smp(&mut r, &random);
+        let srand: [u8; 16] = smp_out(&mut r)[0][1..].try_into().unwrap();
+        assert_eq!(c1(&tk, &srand, &inputs), sconfirm);
+        // Encryption with the short-term key; then the keys.
+        r.events.clear();
+        enable_encryption(&mut r, &Bond { ediv: 0, rand: [0; 8], ltk: s1(&tk, &srand, &mrand) });
+        r.advance(200);
+        assert!(r.is_encrypted());
+        let keys = smp_out(&mut r);
+        assert_eq!(keys.iter().map(|p| p[0]).collect::<Vec<_>>(), [0x06, 0x07, 0x08, 0x09]);
+        assert!(r.cfg.bond.is_none());
+        for (code, len) in [(0x06u8, 16usize), (0x07, 10), (0x08, 16), (0x09, 7)] {
+            let mut p = vec![code];
+            p.extend(std::iter::repeat_n(0x33, len));
+            smp(&mut r, &p);
+        }
+        assert_eq!((r.smp.completed, r.smp.failures), (1, 0));
+        let bond = r.cfg.bond.expect("the keyboard remembers the new bond");
+        assert_eq!(bond.ltk[..], keys[0][1..]);
+        assert_eq!(bond.ediv.to_le_bytes()[..], keys[1][1..3]);
+        assert_eq!(bond.rand[..], keys[1][3..]);
+        assert!(!r.in_pairing_mode());
+        // A new host finds its notifications off.
+        assert!(!r.att.notifying(gatt::H_KEYS_CCCD));
+        // The next connection is encrypted with the new bond.
+        r.kbd_disconnect(REASON_REMOTE_USER);
+        r.events.clear();
+        create_connection(&mut r);
+        r.wake();
+        r.advance(r.now() + 100);
+        enable_encryption(&mut r, &bond);
+        r.advance(r.now() + 200);
+        assert!(r.is_encrypted());
+    }
+
+    #[test]
+    fn the_keyboards_bond_survives_in_the_state_file() {
+        let bond = Some(Bond { ediv: 0x12AB, rand: [1, 2, 3, 4, 5, 6, 7, 0xFF], ltk: [0xA5; 16] });
+        assert_eq!(Bond::from_text(&Bond::to_text(&bond)), Ok(bond));
+        assert_eq!(Bond::from_text(&Bond::to_text(&None)), Ok(None));
+        assert!(Bond::from_text("").is_err());
+        assert!(Bond::from_text("12ab 0102 a5").is_err());
+    }
+
+    #[test]
+    fn a_wrong_pairing_key_loses_the_link() {
+        use crate::smp::{c1, LegacyInputs};
+        let mut r = radio();
+        init(&mut r);
+        r.smp.settings.io = crate::smp::IO_NO_INPUT_NO_OUTPUT;
+        r.enter_pairing_mode();
+        create_connection(&mut r);
+        r.advance(100);
+        r.acl.clear();
+        // Just Works, up to the short-term key.
+        let preq = [0x01, 0x03, 0x00, 0x01, 16, 0x00, 0x00];
+        smp(&mut r, &preq);
+        let pres: [u8; 7] = smp_out(&mut r)[0].clone().try_into().unwrap();
+        let inputs = LegacyInputs { preq, pres, initiator_type: 0, initiator: r.cfg.bd_addr, responder_type: 1, responder: r.cfg.kbd_addr };
+        let mut confirm = vec![0x03];
+        confirm.extend_from_slice(&c1(&[0; 16], &[9; 16], &inputs));
+        smp(&mut r, &confirm);
+        smp(&mut r, &[&[0x04u8][..], &[9; 16]].concat());
+        assert!(r.smp.link_key().is_some());
+        r.events.clear();
+        enable_encryption(&mut r, &Bond { ediv: 0, rand: [0; 8], ltk: [0xEE; 16] });
+        r.advance(200);
+        assert!(!r.is_connected());
+        assert_eq!(r.facts.mic_failures, 1);
+        assert!(r.smp.idle());
     }
 
     #[test]

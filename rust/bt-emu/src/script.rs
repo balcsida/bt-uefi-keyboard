@@ -7,7 +7,13 @@
 //! wait connections >= 2      ... or for a counter (see `value` below)
 //! sleep 500                  milliseconds
 //! wake                       a key that sends nothing: the keyboard wakes and advertises
-//! pairing-mode               its pairing button: discoverable, undirected advertising
+//! pairing-mode               its pairing button: discoverable, undirected advertising,
+//!                            the old bond forgotten
+//! passkey 123456             the user types this passkey on the keyboard, and Enter
+//! read-passkey 20000         ... the passkey the PC shows: the six digits after the last
+//!                            "passkey" on its screen (the file given with --screen, which
+//!                            QEMU writes the serial console to), waited for this long
+//! wait-screen 20000 Shell>   wait until the PC's screen shows this text
 //! type echo hi{enter}        type text; {enter} {esc} {tab} {bs} {del} {up} {down} {left}
 //!                            {right} {space} {f1}..{f12}, and {wait:MS} for a pause
 //! report 00 51               one keyboard report: modifiers, then the keys held (hex);
@@ -26,7 +32,12 @@
 //!                            controller (bd-addr, firmware-loaded, encryption-change-v1),
 //!                            the next ACL packets' USB transfers (acl-merge N,
 //!                            acl-split BYTES), and lose-on-cancel 1 to lose data the
-//!                            way a real controller passed through to QEMU does
+//!                            way a real controller passed through to QEMU does;
+//!                            pairing (pairing off|legacy|sc, io keyboard|none,
+//!                            key-size N, keys-from-host and keys-from-kbd as the key
+//!                            distribution bits, impostor 1 for a "keyboard" that
+//!                            pairs without knowing the passkey, pairing-keys-delay MS
+//!                            from the encryption to the keyboard's keys)
 //! expect encrypted           check a state or counter now; a failure is logged and counted
 //! expect smp-from-host = 0
 //! note reached the shell     a line in the log
@@ -37,8 +48,11 @@
 //! hold) is logged with `FAILED`; a timed-out wait also ends the script,
 //! while the emulator goes on serving.
 
+use std::path::PathBuf;
+
 use crate::note;
 use crate::radio::Radio;
+use crate::smp;
 use crate::usbdev::UsbDev;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +77,9 @@ pub enum Step {
     Sleep(u64),
     Wake,
     PairingMode,
+    Passkey(u32),
+    ReadPasskey(u64),
+    WaitScreen(String, u64),
     Type(String),
     Report(u8, Vec<u8>),
     Hold(u8, u64),
@@ -187,6 +204,19 @@ pub fn parse(text: &str) -> Result<Vec<(usize, Step)>, String> {
                 "sleep" => Step::Sleep(number(0)?),
                 "wake" => Step::Wake,
                 "pairing-mode" => Step::PairingMode,
+                "passkey" => match tokens.as_slice() {
+                    [digits] if digits.len() == 6 && digits.bytes().all(|b| b.is_ascii_digit()) => Step::Passkey(digits.parse().unwrap()),
+                    _ => return Err("a passkey is six digits".into()),
+                },
+                "read-passkey" => Step::ReadPasskey(if tokens.is_empty() { 30_000 } else { number(0)? }),
+                "wait-screen" => {
+                    let timeout = number(0)?;
+                    let text = rest.split_once(char::is_whitespace).map_or("", |(_, t)| t.trim());
+                    if text.is_empty() {
+                        return Err("wait-screen takes a timeout and the text to wait for".into());
+                    }
+                    Step::WaitScreen(text.into(), timeout)
+                }
                 "type" => {
                     keys_of(rest)?;
                     Step::Type(rest.into())
@@ -236,6 +266,12 @@ pub fn value(name: &str, radio: &Radio, dev: &UsbDev) -> Option<i64> {
         "advertising" => i64::from(radio.is_advertising()),
         "scanning" => i64::from(radio.is_scanning()),
         "adv-reports" => i64::from(f.adv_reports),
+        "pairing-mode" => i64::from(radio.in_pairing_mode()),
+        "bonded" => i64::from(radio.cfg.bond.is_some()),
+        "pairing-requests" => i64::from(radio.smp.requests),
+        "pairings" => i64::from(radio.smp.completed),
+        "pairing-failures" => i64::from(radio.smp.failures),
+        "last-pairing-failure" => i64::from(radio.smp.last_failure),
         "connected" => i64::from(radio.is_connected()),
         "encrypted" => i64::from(radio.is_encrypted()),
         "unsent" => (radio.unsent() + dev.acl_waiting()) as i64,
@@ -316,6 +352,27 @@ fn apply_setting(name: &str, value: &str, radio: &mut Radio, dev: &mut UsbDev) -
         // The next ACL packets' layout in USB transfers.
         "acl-merge" => dev.shaping.merge = ms()? as usize,
         "acl-split" => dev.shaping.split_at = Some(ms()? as usize),
+        // How the keyboard pairs.
+        "pairing" => {
+            radio.smp.settings.method = match value {
+                "off" => smp::Method::None,
+                "legacy" => smp::Method::Legacy,
+                "sc" => smp::Method::SecureConnections,
+                _ => return Err(format!("pairing can be off, legacy or sc, not {value:?}")),
+            }
+        }
+        "io" => {
+            radio.smp.settings.io = match value {
+                "keyboard" => smp::IO_KEYBOARD_ONLY,
+                "none" => smp::IO_NO_INPUT_NO_OUTPUT,
+                _ => return Err(format!("io can be keyboard or none, not {value:?}")),
+            }
+        }
+        "key-size" => radio.smp.settings.max_key_size = ms()? as u8,
+        "keys-from-host" => radio.smp.settings.key_dist.0 = ms()? as u8,
+        "keys-from-kbd" => radio.smp.settings.key_dist.1 = ms()? as u8,
+        "impostor" => radio.smp.settings.impostor = ms()? != 0,
+        "pairing-keys-delay" => radio.cfg.pairing_keys_delay_ms = ms()?,
         // What the keyboard remembers of this host.
         "bond" => {
             let bond = radio.cfg.bond;
@@ -334,6 +391,46 @@ fn apply_setting(name: &str, value: &str, radio: &mut Radio, dev: &mut UsbDev) -
     Ok(())
 }
 
+/// What a serial console's output shows as text: without the terminal
+/// escape sequences (ESC [ parameters, one final byte).
+pub fn screen_text(screen: &[u8]) -> String {
+    let mut text = String::new();
+    let mut bytes = screen.iter().copied().peekable();
+    while let Some(b) = bytes.next() {
+        if b == 0x1B && bytes.peek() == Some(&b'[') {
+            bytes.next();
+            for c in bytes.by_ref() {
+                if (0x40..=0x7E).contains(&c) {
+                    break;
+                }
+            }
+        } else if b.is_ascii() {
+            text.push(b as char);
+        }
+    }
+    text
+}
+
+/// The six digits after the last "passkey" in what the PC's screen showed
+/// ("123 456" counts too).
+pub fn passkey_on_screen(screen: &[u8]) -> Option<u32> {
+    let text = screen_text(screen).to_ascii_lowercase();
+    let after = &text[text.rfind("passkey")? + "passkey".len()..];
+    let start = after.find(|c: char| c.is_ascii_digit())?;
+    if start > 60 {
+        return None;
+    }
+    let mut digits = String::new();
+    for c in after[start..].chars() {
+        match c {
+            '0'..='9' => digits.push(c),
+            ' ' if !digits.is_empty() && digits.len() < 6 => {}
+            _ => break,
+        }
+    }
+    if digits.len() == 6 { digits.parse().ok() } else { None }
+}
+
 pub struct Script {
     steps: Vec<(usize, Step)>,
     at: usize,
@@ -342,11 +439,20 @@ pub struct Script {
     pub failures: u32,
     pub quit: bool,
     stopped: bool,
+    /// The file the PC's screen (its serial console) is written to, and
+    /// how much of it earlier steps have read.
+    screen: Option<PathBuf>,
+    screen_read: usize,
 }
 
 impl Script {
     pub fn new(steps: Vec<(usize, Step)>) -> Self {
-        Self { steps, at: 0, since: None, failures: 0, quit: false, stopped: false }
+        Self { steps, at: 0, since: None, failures: 0, quit: false, stopped: false, screen: None, screen_read: 0 }
+    }
+
+    pub fn with_screen(mut self, screen: Option<PathBuf>) -> Self {
+        self.screen = screen;
+        self
     }
 
     /// Nothing more will run: the end was reached, or a step stopped it.
@@ -393,6 +499,45 @@ impl Script {
                 }
                 Step::Wake => radio.wake(),
                 Step::PairingMode => radio.enter_pairing_mode(),
+                Step::Passkey(passkey) => radio.type_passkey(passkey),
+                Step::ReadPasskey(timeout) => {
+                    let since = *self.since.get_or_insert(now);
+                    let Some(path) = &self.screen else {
+                        note!("script: line {line}: FAILED: read-passkey needs --screen FILE");
+                        self.failures += 1;
+                        self.stopped = true;
+                        return None;
+                    };
+                    let screen = std::fs::read(path).unwrap_or_default();
+                    match passkey_on_screen(screen.get(self.screen_read..).unwrap_or_default()) {
+                        Some(passkey) => {
+                            note!("script: the screen shows passkey {passkey:06} ({} ms)", now.saturating_sub(since));
+                            self.screen_read = screen.len();
+                            radio.type_passkey(passkey);
+                        }
+                        None if now.saturating_sub(since) >= timeout => {
+                            note!("script: line {line}: FAILED: no passkey on the screen after {timeout} ms");
+                            self.failures += 1;
+                            self.stopped = true;
+                            return None;
+                        }
+                        None => return Some((since + timeout).min(now + 50)),
+                    }
+                }
+                Step::WaitScreen(text, timeout) => {
+                    let since = *self.since.get_or_insert(now);
+                    let shown = self.screen.as_ref().is_some_and(|path| screen_text(&std::fs::read(path).unwrap_or_default()).contains(&text));
+                    if !shown {
+                        if now.saturating_sub(since) >= timeout {
+                            note!("script: line {line}: FAILED: the screen didn't show {text:?} within {timeout} ms");
+                            self.failures += 1;
+                            self.stopped = true;
+                            return None;
+                        }
+                        return Some((since + timeout).min(now + 100));
+                    }
+                    note!("script: the screen shows {text:?} ({} ms)", now.saturating_sub(since));
+                }
                 Step::Type(text) => {
                     note!("script: typing {text:?}");
                     for key in keys_of(&text).unwrap_or_default() {
@@ -518,6 +663,26 @@ mod tests {
         assert_eq!(script.run(1150, &mut radio, &mut dev), None);
         assert!(script.finished());
         assert_eq!(script.failures, 1);
+    }
+
+    #[test]
+    fn the_passkey_is_read_off_the_screen() {
+        assert_eq!(passkey_on_screen(b"Type the passkey 012345 on the keyboard, then Enter"), Some(12345));
+        assert_eq!(passkey_on_screen(b"\x1b[2J\x1b[01;01HPasskey:\x1b[05;10H  123 456\r\n"), Some(123456));
+        // The last one counts; an incomplete one doesn't.
+        assert_eq!(passkey_on_screen(b"passkey 111111 ... new passkey 222222"), Some(222222));
+        assert_eq!(passkey_on_screen(b"passkey 12345"), None);
+        assert_eq!(passkey_on_screen(b"passkey 1234567"), None);
+        assert_eq!(passkey_on_screen(b"no such thing 123456"), None);
+        assert_eq!(parse("passkey 000042\nread-passkey\nread-passkey 5000").unwrap().into_iter().map(|(_, s)| s).collect::<Vec<_>>(), [
+            Step::Passkey(42),
+            Step::ReadPasskey(30_000),
+            Step::ReadPasskey(5000)
+        ]);
+        assert!(parse("passkey 12345").is_err());
+        assert_eq!(parse("wait-screen 5000 FS0:\\> ").unwrap()[0].1, Step::WaitScreen("FS0:\\>".into(), 5000));
+        assert!(parse("wait-screen 5000").is_err());
+        assert_eq!(screen_text(b"\x1b[1m\x1b[33mFS0:\\>\x1b[0m echo"), "FS0:\\> echo");
     }
 
     #[test]

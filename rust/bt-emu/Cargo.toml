@@ -15,3 +15,8 @@ publish = false
 uefi-bt = { path = "../uefi-bt" }
 # The MediaTek vendor channel's constants.
 mtk-bt = { path = "../mtk-bt" }
+# The keyboard's side of pairing (src/smp.rs): AES-128, AES-CMAC and P-256,
+# the versions the driver's host stack already brings into Cargo.lock.
+aes = "0.8"
+cmac = "0.7"
+p256 = { version = "0.13", default-features = false, features = ["arithmetic"] }
