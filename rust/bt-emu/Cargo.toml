@@ -1,0 +1,17 @@
+[package]
+name = "bt-emu"
+description = "An emulated MT7922 Bluetooth controller with a BLE keyboard behind it, for the offline tests (QEMU usb-redir)"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+version.workspace = true
+publish = false
+
+# A host program (std), never built for UEFI: scripts/qemu-driver-test.sh
+# builds it with plain `cargo build -p bt-emu`.
+
+[dependencies]
+# The same bond files, key tables and Report Map parser the driver uses.
+uefi-bt = { path = "../uefi-bt" }
+# The MediaTek vendor channel's constants.
+mtk-bt = { path = "../mtk-bt" }

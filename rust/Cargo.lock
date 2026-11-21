@@ -41,6 +41,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "bt-emu"
+version = "0.1.0"
+dependencies = [
+ "mtk-bt",
+ "uefi-bt",
+]
+
+[[package]]
 name = "bt-hci"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

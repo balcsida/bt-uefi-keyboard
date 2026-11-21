@@ -1,8 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["mtk-bt", "uefi-bt", "bt-hci-probe", "bt-le-scan", "bt-kb-probe", "bt-kb-dxe", "bt-kb-log", "ebs-test"]
+members = ["mtk-bt", "uefi-bt", "bt-hci-probe", "bt-le-scan", "bt-kb-probe", "bt-kb-dxe", "bt-kb-log", "ebs-test", "bt-emu"]
 # Plain `cargo test` runs the host-testable crates only; UEFI crates are built
-# with `--target x86_64-unknown-uefi` (see scripts/build-rust.sh).
+# with `--target x86_64-unknown-uefi` (see scripts/build-rust.sh). bt-emu is a
+# host program (the emulated controller and keyboard of the offline tests).
 default-members = ["mtk-bt"]
 
 [workspace.package]

@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-# Build the Rust UEFI apps (release) and run the host tests.
+# Build the Rust UEFI apps (release) and run the host tests: of the two
+# libraries, and of bt-emu, the emulated controller and keyboard that the
+# offline tests (scripts/qemu-driver-test.sh) run the driver against.
 set -euo pipefail
 . "$(dirname "$0")/common.sh"
 export PATH="$HOME/.cargo/bin:$PATH"
 ensure_firmware
 cd "$ROOT/rust"
-MTK_FW_PATH="$FW_BIN" cargo test -p mtk-bt -p uefi-bt --lib --quiet 2>&1 | grep -E '^test result|FAILED|panicked' || true
+MTK_FW_PATH="$FW_BIN" cargo test -p mtk-bt -p uefi-bt -p bt-emu --lib --quiet 2>&1 | grep -E '^test result|FAILED|panicked' || true
+cargo build --quiet -p bt-emu 2>&1 | grep -E '^(warning|error)' || true
 # The driver pins the firmware image it accepts and the bonds it trusts
 # (bt-kb-dxe/build.rs): the image the scripts use, and the bonds exported to
 # qemu/keys/. Both are also written next to the build, for
