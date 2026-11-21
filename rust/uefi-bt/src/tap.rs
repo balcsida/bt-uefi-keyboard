@@ -382,6 +382,12 @@ impl LinkTap {
 
     /// Decide about one notification. `layout_known`: the input report's
     /// handle and layout are known, so it can be decoded.
+    ///
+    /// While earlier notifications are still kept, a new one is kept
+    /// behind them even if the layout is known by now: delivered at once,
+    /// it would overtake them (an Enter in front of its own command line,
+    /// seen with the emulated keyboard on Nov 14). The caller replays
+    /// them all with [`LinkTap::take_replay`].
     pub fn on_notification(&mut self, n: &Notification<'_>, layout_known: bool) -> Verdict {
         if self.conn != Some(n.conn) {
             return Verdict::Foreign;
@@ -393,7 +399,7 @@ impl LinkTap {
             }
             return self.stash(n, false);
         }
-        if layout_known { Verdict::Deliver } else { self.stash(n, true) }
+        if layout_known && self.stash.is_empty() && !self.stash_overflowed { Verdict::Deliver } else { self.stash(n, true) }
     }
 
     fn stash(&mut self, n: &Notification<'_>, encrypted: bool) -> Verdict {
@@ -639,6 +645,22 @@ mod tests {
         assert_eq!(replay.unencrypted, 0);
         assert!(!replay.overflowed);
         assert!(tap.take_replay(true).is_none());
+    }
+
+    #[test]
+    fn a_report_doesnt_overtake_the_kept_ones() {
+        // Two reports arrive during discovery. The layout becomes known,
+        // and a third arrives before the first two were replayed: it has
+        // to wait behind them.
+        let (mut tap, _guard) = ready(false);
+        let (a, b, c) = (report(H, 0x04), report(H, 0x05), report(H, 0x28));
+        assert_eq!(tap.on_notification(&notification(&a).unwrap(), false), Verdict::Stashed);
+        assert_eq!(tap.on_notification(&notification(&b).unwrap(), false), Verdict::Stashed);
+        assert_eq!(tap.on_notification(&notification(&c).unwrap(), true), Verdict::Stashed);
+        let replay = tap.take_replay(true).unwrap();
+        assert_eq!(replay.reports.iter().map(|(_, value)| value[1]).collect::<alloc::vec::Vec<_>>(), [0x04, 0x05, 0x28]);
+        // With nothing kept, reports are delivered as they come.
+        assert_eq!(tap.on_notification(&notification(&c).unwrap(), true), Verdict::Deliver);
     }
 
     #[test]
