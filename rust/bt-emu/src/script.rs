@@ -28,7 +28,8 @@
 //! set encrypt-delay 150      a setting: the delays (connect-delay, encrypt-delay,
 //!                            first-report-delay, att-delay, key-interval, supervision),
 //!                            the keyboard's habits (param-after, idle, battery-after: ms
-//!                            or `off`), what it remembers (bond none|wrong-key), the
+//!                            or `off`; signal-timeout: how long it waits for the answer
+//!                            to a parameter request), what it remembers (bond none|wrong-key), the
 //!                            controller (bd-addr, firmware-loaded, encryption-change-v1),
 //!                            the next ACL packets' USB transfers (acl-merge N,
 //!                            acl-split BYTES), and lose-on-cancel 1 to lose data the
@@ -277,6 +278,7 @@ pub fn value(name: &str, radio: &Radio, dev: &UsbDev) -> Option<i64> {
         "unsent" => (radio.unsent() + dev.acl_waiting()) as i64,
         "leds" => radio.leds.map_or(-1, i64::from),
         "keys-notifying" => i64::from(radio.att.notifying(crate::gatt::H_KEYS_CCCD)),
+        "reports-notifying" => radio.att.reports_notifying() as i64,
         "commands" => i64::from(f.commands),
         "hci-resets" => i64::from(f.hci_resets),
         "unknown-commands" => f.unknown_commands.len() as i64,
@@ -298,6 +300,7 @@ pub fn value(name: &str, radio: &Radio, dev: &UsbDev) -> Option<i64> {
         "param-requests" => i64::from(f.param_requests),
         "param-accepted" => i64::from(f.param_accepted),
         "param-rejected" => i64::from(f.param_rejected),
+        "param-ignored" => i64::from(f.param_ignored),
         "connection-updates" => i64::from(f.connection_updates),
         "wmt-commands" => i64::from(s.wmt_commands),
         "merged" => i64::from(s.merged_transfers),
@@ -342,6 +345,7 @@ fn apply_setting(name: &str, value: &str, radio: &mut Radio, dev: &mut UsbDev) -
         "key-interval" => radio.cfg.key_interval_ms = ms()?,
         "supervision" => radio.cfg.supervision_ms = ms()?,
         "param-after" => radio.cfg.param_request_after_ms = optional_ms()?,
+        "signal-timeout" => radio.cfg.signal_timeout_ms = ms()?,
         "idle" => radio.cfg.idle_disconnect_ms = optional_ms()?,
         "battery-after" => radio.cfg.battery_after_ms = optional_ms()?,
         "encryption-change-v1" => radio.cfg.encryption_change_v1 = ms()? != 0,

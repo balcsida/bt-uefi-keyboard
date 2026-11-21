@@ -108,6 +108,14 @@ pub struct Config {
     /// Between key reports: one connection event.
     pub key_interval_ms: u64,
     pub param_request_after_ms: Option<u64>,
+    /// How long the keyboard waits for the answer to a parameter request
+    /// before it gives the host up and ends the link. The real one: 60.0 s
+    /// (Nov 3 and Nov 21, with TrouBLE 0.8's answers, which don't carry
+    /// the request's identifier).
+    pub signal_timeout_ms: u64,
+    /// The real keyboard goes to sleep after more than 8 and less than 22
+    /// minutes without a key (Nov 21, with Linux). What looked like 60 s
+    /// until then was `signal_timeout_ms`.
     pub idle_disconnect_ms: Option<u64>,
     pub battery_after_ms: Option<u64>,
     /// How long the keyboard takes to notice a link the host dropped
@@ -136,7 +144,8 @@ impl Default for Config {
             att_delay_ms: 2,
             key_interval_ms: 12,
             param_request_after_ms: Some(5000),
-            idle_disconnect_ms: Some(60_000),
+            signal_timeout_ms: 60_000,
+            idle_disconnect_ms: Some(600_000),
             battery_after_ms: Some(2500),
             supervision_ms: 2000,
             encryption_change_v1: false,
@@ -167,6 +176,8 @@ pub struct Facts {
     pub param_requests: u32,
     pub param_accepted: u32,
     pub param_rejected: u32,
+    /// Responses that didn't carry the request's identifier.
+    pub param_ignored: u32,
     pub connection_updates: u32,
     /// Advertising reports sent to a scanning host.
     pub adv_reports: u32,
@@ -179,6 +190,11 @@ struct Link {
     interval: u16,
     latency: u16,
     timeout: u16,
+    /// The identifier of the keyboard's parameter request the host hasn't
+    /// answered yet.
+    asked: Option<u8>,
+    /// How many of them the host has accepted on this link.
+    agreed: u8,
 }
 
 struct Initiating {
@@ -198,6 +214,8 @@ enum Timer {
     ToHost { cid: u16, payload: Vec<u8> },
     ConnectionUpdated { interval: u16, latency: u16, timeout: u16 },
     ParamRequest,
+    /// No answer yet to the request with this identifier.
+    SignalTimeout(u8),
     Idle,
     Battery,
     Pump,
@@ -813,6 +831,11 @@ impl Radio {
         let ends = self.ends();
         self.smp.enter_passkey(passkey, &ends);
         self.after_smp();
+        // The keys pressed are key reports as well (see `pump`).
+        for digit in format!("{passkey:06}").bytes() {
+            self.tap(0, if digit == b'0' { 0x27 } else { 0x1E + (digit - b'1') });
+        }
+        self.tap(0, 0x28);
         self.last_activity = self.now;
     }
 
@@ -822,8 +845,10 @@ impl Radio {
         self.reassembly = None;
         self.disarm(Timer::of_link);
         // Pairing mode lasts until a host has paired: the keyboard is
-        // discoverable again.
+        // discoverable again, and what was typed for the failed attempt is
+        // forgotten.
         if self.pairing_mode {
+            self.outbox.retain(|o| !o.key_report);
             self.start_advertising();
         }
     }
@@ -848,7 +873,12 @@ impl Radio {
                 }
                 let Some(i) = self.initiating.take() else { return };
                 self.advertising = false;
-                let link = Link { encrypted: false, host_type: i.own_type, interval: i.interval, latency: i.latency, timeout: i.timeout };
+                let link = Link { encrypted: false, host_type: i.own_type, interval: i.interval, latency: i.latency, timeout: i.timeout, asked: None, agreed: 0 };
+                // Its requests are numbered from 2 on every connection
+                // (inferred: on Nov 3 TrouBLE 0.8's answers, numbered 1, 2,
+                // 3 from the driver's start, fitted in a boot's second
+                // connection and not in its first).
+                self.signal_id = 1;
                 note!("link: connected (handle {HANDLE:#06x}, interval {} x 1.25 ms)", link.interval);
                 self.facts.connections += 1;
                 self.connection_complete(0, Some(&link));
@@ -931,6 +961,12 @@ impl Radio {
                 self.le_event(LE_CONNECTION_UPDATE_COMPLETE, &p);
             }
             Timer::ParamRequest => self.request_params(20, 36, 4, 200),
+            Timer::SignalTimeout(id) => {
+                if self.link.as_ref().is_some_and(|l| l.asked == Some(id)) {
+                    note!("kbd: no answer to its parameter request for {} ms: it gives the host up", self.cfg.signal_timeout_ms);
+                    self.kbd_disconnect(REASON_REMOTE_USER);
+                }
+            }
             Timer::Idle => {
                 let Some(idle) = self.cfg.idle_disconnect_ms else { return };
                 if self.link.is_none() {
@@ -1085,14 +1121,27 @@ impl Radio {
                         self.arm(self.now + self.cfg.att_delay_ms, Timer::ToHost { cid: CID_ATT, payload: response });
                     }
                 }
+                // A switch may have been turned on.
+                self.second_request();
+                self.pump();
             }
             CID_SIGNALING => match (payload.first().copied(), payload.get(1).copied()) {
-                // Connection Parameter Update Response.
-                (Some(0x13), Some(_)) => {
+                // Connection Parameter Update Response: the answer only
+                // if it carries the request's identifier.
+                (Some(0x13), Some(id)) => {
+                    let Some(link) = self.link.as_mut() else { return };
+                    if link.asked != Some(id) {
+                        note!("kbd: a parameter response with identifier {id}, and its request has {:?}: ignored", link.asked);
+                        self.facts.param_ignored += 1;
+                        return;
+                    }
+                    link.asked = None;
                     let accepted = payload.get(4..6) == Some(&[0, 0]);
                     note!("kbd: connection parameter request {}", if accepted { "accepted" } else { "rejected" });
                     if accepted {
+                        link.agreed += 1;
                         self.facts.param_accepted += 1;
+                        self.second_request();
                     } else {
                         self.facts.param_rejected += 1;
                     }
@@ -1127,6 +1176,12 @@ impl Radio {
             };
             if secure && !encrypted {
                 return; // kept until the link is encrypted
+            }
+            // Key reports are kept until the host has turned their
+            // notifications on, and sent then: the real keyboard did so
+            // with the passkey typed on it (Nov 21).
+            if self.outbox.front().is_some_and(|o| o.key_report) && !self.att.notifying(gatt::H_KEYS_CCCD) {
+                return;
             }
             if self.now < self.next_send_at {
                 self.arm(self.next_send_at, Timer::Pump);
@@ -1216,10 +1271,10 @@ impl Radio {
     /// The keyboard asks for new connection parameters over L2CAP
     /// signaling (interval in 1.25 ms, timeout in 10 ms).
     pub fn request_params(&mut self, min: u16, max: u16, latency: u16, timeout: u16) {
-        if self.link.is_none() {
-            return;
-        }
+        let Some(link) = self.link.as_mut() else { return };
         self.signal_id = self.signal_id.wrapping_add(1).max(1);
+        link.asked = Some(self.signal_id);
+        self.arm(self.now + self.cfg.signal_timeout_ms, Timer::SignalTimeout(self.signal_id));
         let mut pdu = vec![0x12, self.signal_id, 8, 0];
         for v in [min, max, latency, timeout] {
             pdu.extend_from_slice(&v.to_le_bytes());
@@ -1227,6 +1282,17 @@ impl Radio {
         note!("kbd: asks for new connection parameters (interval {min}-{max} x 1.25 ms, latency {latency})");
         self.facts.param_requests += 1;
         self.to_host(CID_SIGNALING, &pdu);
+    }
+
+    /// The keyboard's second request, for the parameters it settles on (15
+    /// ms, latency 20): once the host has accepted the first and listens
+    /// to the first input report. Seen with BlueZ in the connection event
+    /// of that switch's write (Nov 21), and with the driver 0.3 s after
+    /// the first request, the switch being on from the bond (Nov 3).
+    fn second_request(&mut self) {
+        if self.link.as_ref().is_some_and(|l| l.agreed == 1 && l.asked.is_none()) && self.att.notifying(gatt::H_CONSUMER_CCCD) {
+            self.request_params(12, 12, 20, 200);
+        }
     }
 
     /// Any L2CAP PDU from the keyboard's side, for tests that play a
@@ -1538,12 +1604,22 @@ mod tests {
         let sent: Vec<Vec<u8>> = r.acl.drain(..).collect();
         assert_eq!(sent[0][8..], [0x1B, 0x10, 0x00, 57]);
         let request = &sent[1];
-        assert_eq!(&request[4..], &[12, 0, 0x05, 0x00, 0x12, 1, 8, 0, 20, 0, 36, 0, 4, 0, 200, 0]);
-        // The host accepts: the signaling response, then the update.
-        let mut response = HANDLE.to_le_bytes().to_vec();
-        response.extend_from_slice(&[10, 0, 6, 0, 0x05, 0x00, 0x13, 1, 2, 0, 0, 0]);
-        r.acl_from_host(&response);
+        assert_eq!(&request[4..], &[12, 0, 0x05, 0x00, 0x12, 2, 8, 0, 20, 0, 36, 0, 4, 0, 200, 0]);
+        // An answer that doesn't carry the request's identifier isn't one.
+        accept_params(&mut r, 1);
+        assert_eq!((r.facts.param_accepted, r.facts.param_ignored), (0, 1));
+        assert!(r.acl.is_empty());
+        // The host accepts: the signaling response, then the update. The
+        // keyboard asks for the parameters it settles on at once, since
+        // this host listens to its first input report.
+        accept_params(&mut r, 2);
         assert_eq!(r.facts.param_accepted, 1);
+        let second: Vec<Vec<u8>> = r.acl.drain(..).collect();
+        assert_eq!(second.len(), 1);
+        assert_eq!(&second[0][4..], &[12, 0, 0x05, 0x00, 0x12, 3, 8, 0, 12, 0, 12, 0, 20, 0, 200, 0]);
+        accept_params(&mut r, 3);
+        assert_eq!((r.facts.param_accepted, r.facts.param_requests), (2, 2));
+        assert!(r.acl.is_empty());
         let mut p = HANDLE.to_le_bytes().to_vec();
         for v in [20u16, 36, 4, 200, 0, 0] {
             p.extend_from_slice(&v.to_le_bytes());
@@ -1554,27 +1630,53 @@ mod tests {
         assert_eq!(r.events.back(), Some(&vec![0x3E, 10, 0x03, 0, 0x00, 0x02, 20, 0, 4, 0, 200, 0]));
     }
 
+    /// The host's "accepted" to the parameter request with this identifier.
+    fn accept_params(r: &mut Radio, identifier: u8) {
+        let mut response = HANDLE.to_le_bytes().to_vec();
+        response.extend_from_slice(&[10, 0, 6, 0, 0x05, 0x00, 0x13, identifier, 2, 0, 0, 0]);
+        r.acl_from_host(&response);
+    }
+
     #[test]
-    fn the_keyboard_sleeps_after_a_minute_and_comes_back_on_a_key() {
+    fn a_host_that_doesnt_answer_the_parameter_request_is_given_up() {
+        // 60 s after the request, which came 5 s after connecting, and
+        // whatever is typed meanwhile.
         let mut r = session();
         r.advance(30_000);
         r.tap(0, 0x04);
-        r.advance(89_000);
+        accept_params(&mut r, 1);
+        r.advance(64_900);
         assert!(r.is_connected());
         r.events.clear();
-        r.advance(90_100);
+        r.advance(65_200);
         assert!(!r.is_connected());
         assert_eq!(r.events.pop_front(), Some(vec![0x05, 4, 0, 0x00, 0x02, REASON_REMOTE_USER]));
         // The next key wakes it; the host connects and encrypts again, and
         // the key arrives.
         create_connection(&mut r);
         r.tap(0, 0x05);
-        r.advance(90_200);
+        r.advance(65_300);
         assert!(r.is_connected());
         enable_encryption(&mut r, &BOND);
         r.acl.clear();
-        r.advance(90_400);
+        r.advance(65_500);
         assert_eq!(att_out(&mut r).len(), 2);
+    }
+
+    #[test]
+    fn the_keyboard_sleeps_after_ten_minutes_without_a_key() {
+        let mut r = session();
+        r.advance(5100);
+        accept_params(&mut r, 2);
+        accept_params(&mut r, 3);
+        r.advance(30_000);
+        r.tap(0, 0x04);
+        r.advance(629_000);
+        assert!(r.is_connected());
+        r.events.clear();
+        r.advance(630_100);
+        assert!(!r.is_connected());
+        assert_eq!(r.events.pop_front(), Some(vec![0x05, 4, 0, 0x00, 0x02, REASON_REMOTE_USER]));
     }
 
     #[test]
@@ -1687,8 +1789,16 @@ mod tests {
         assert_eq!(bond.ediv.to_le_bytes()[..], keys[1][1..3]);
         assert_eq!(bond.rand[..], keys[1][3..]);
         assert!(!r.in_pairing_mode());
-        // A new host finds its notifications off.
+        // A new host finds its notifications off. The passkey's keys and
+        // Enter wait as key reports until it turns them on.
         assert!(!r.att.notifying(gatt::H_KEYS_CCCD));
+        assert_eq!((r.unsent(), r.facts.key_reports_sent), (14, 0));
+        let mut write = vec![0x12];
+        write.extend_from_slice(&gatt::H_KEYS_CCCD.to_le_bytes());
+        write.extend_from_slice(&[1, 0]);
+        att(&mut r, &write);
+        r.advance(r.now() + 1000);
+        assert_eq!((r.unsent(), r.facts.key_reports_sent), (0, 14));
         // The next connection is encrypted with the new bond.
         r.kbd_disconnect(REASON_REMOTE_USER);
         r.events.clear();

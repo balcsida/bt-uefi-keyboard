@@ -207,8 +207,9 @@ const REPORT_FEATURE: u8 = 3;
 impl AttServer {
     /// The keyboard's table. `bonded_host`: the host has used the keyboard
     /// before, so the switches it turned on then are still on (the
-    /// keyboard keeps them per bonded host): the keyboard report, the
-    /// media keys and the battery level notify from the start.
+    /// keyboard keeps them per bonded host): every input report (an OS
+    /// subscribes to all seven, Nov 21 trace of BlueZ pairing) and the
+    /// battery level notify from the start.
     pub fn keyboard(bonded_host: bool) -> Self {
         let mut b = Builder { attributes: Vec::new(), next: 1 };
         // Generic Access.
@@ -229,9 +230,9 @@ impl AttServer {
         // HID.
         assert_eq!(b.service(UUID_HID_SERVICE), HID_FIRST);
         b.characteristic(0x2A4E, PROP_READ | PROP_WRITE_NO_RESPONSE, &[1], true); // Protocol Mode: report
-        for (id, on) in [(0x10, bonded_host), (0x01, bonded_host), (0x27, false), (0x2C, false), (0x2D, false), (0x2E, false), (0x2F, false)] {
+        for id in [0x10, 0x01, 0x27, 0x2C, 0x2D, 0x2E, 0x2F] {
             let size = if id == 0x01 { 11 } else { 2 };
-            b.report(id, REPORT_INPUT, &vec![0; size], on);
+            b.report(id, REPORT_INPUT, &vec![0; size], bonded_host);
         }
         for id in [0x01, 0x2A, 0x2D] {
             b.report(id, REPORT_OUTPUT, &[0], false);
@@ -257,6 +258,12 @@ impl AttServer {
 
     pub fn value(&self, handle: u16) -> &[u8] {
         self.find(handle).map_or(&[], |a| &a.value)
+    }
+
+    /// How many of the seven HID input reports notify.
+    pub fn reports_notifying(&self) -> usize {
+        let on = |a: &&Attribute| a.kind == UUID_CCCD && (HID_FIRST..H_REPORT_MAP).contains(&a.handle) && a.value.first().is_some_and(|v| v & 1 != 0);
+        self.attributes.iter().filter(on).count()
     }
 
     /// Whether the client switched notifications on at this CCCD.
@@ -488,6 +495,7 @@ mod tests {
         // A bonded host finds its notifications on; a new one doesn't.
         assert!(s.notifying(H_KEYS_CCCD) && s.notifying(H_BATTERY_CCCD));
         assert!(!AttServer::keyboard(false).notifying(H_KEYS_CCCD));
+        assert_eq!((s.reports_notifying(), AttServer::keyboard(false).reports_notifying()), (7, 0));
     }
 
     #[test]
