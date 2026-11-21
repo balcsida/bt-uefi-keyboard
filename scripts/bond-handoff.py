@@ -16,11 +16,17 @@ neither shows the key.
   bond-handoff.py open KEYFILE [--var FILE] --out FILE.bond
                                      decrypt BtKbHandOff into a bond file as
                                      export-bond.sh writes them (mode 600)
-  bond-handoff.py import KEYFILE [--var FILE] [--bluez DIR] [--dry-run]
+  bond-handoff.py import KEYFILE [--var FILE] [--bluez DIR] [--like ADDRESS] [--dry-run]
                                      give the bond to BlueZ: write the key into
                                      the keyboard's info file, if it isn't the
-                                     one there already (run it before
-                                     bluetooth.service starts, as root)
+                                     one there already. As root, before
+                                     bluetooth.service starts, or restart it
+                                     afterwards (stopping it first is no use:
+                                     D-Bus starts it again at once).
+                                     --like: a keyboard that takes a new address
+                                     at every pairing is new to BlueZ each time;
+                                     this gives it the name and settings BlueZ
+                                     has for it under its previous address
   bond-handoff.py selftest           the format against fixed values
 
 The format (version 1), 147 bytes:
@@ -232,25 +238,35 @@ def current_key(info):
     return (found["Key"].upper(), found.get("EDiv", "0"), found.get("Rand", "0"))
 
 
-def import_bond(bond, bluez, dry_run):
+def import_bond(bond, bluez, dry_run, like=None):
     """Returns a line about what was done."""
     directory = os.path.join(bluez, bond["adapter"], bond["peer"])
     path = os.path.join(directory, "info")
-    old = None
+    old = base = None
     if os.path.exists(path):
         with open(path, encoding="utf-8", errors="replace") as f:
-            old = f.read()
+            old = base = f.read()
+    elif like:
+        # The same keyboard under its previous address: everything but the
+        # keys carries over.
+        try:
+            with open(os.path.join(bluez, bond["adapter"], like, "info"), encoding="utf-8", errors="replace") as f:
+                base = f.read()
+        except OSError:
+            raise HandOffError(f"BlueZ knows no device {like} to take the settings from") from None
     if current_key(old) == (bond["ltk"], bond["ediv"], bond["rand"]):
         return f"BlueZ already has this bond for {bond['peer']}: nothing to do"
     if not os.path.isdir(os.path.join(bluez, bond["adapter"])):
         raise HandOffError(f"BlueZ has no adapter {bond['adapter']} under {bluez}: the bond belongs to another controller")
     what = "replace the key BlueZ has" if current_key(old) else ("add the key to the device BlueZ knows" if old else "make the device known to BlueZ")
+    if old is None and base is not None:
+        what += f", with the settings of {like},"
     if dry_run:
         return f"would {what} for {bond['peer']} ({path})"
     os.makedirs(directory, mode=0o700, exist_ok=True)
     if old is not None:
         write_private(path + ".before-handoff", old)
-    write_private(path + ".new", info_with_bond(old, bond))
+    write_private(path + ".new", info_with_bond(base, bond))
     os.replace(path + ".new", path)
     return f"done: {what} for {bond['peer']} ({path}); bluetoothd reads it when it starts"
 
@@ -330,6 +346,21 @@ def selftest():
         assert import_bond(changed, tmp, False).startswith("done: replace the key")
         assert current_key(open(path).read())[0] == "AB" * 16
         assert current_key(open(path + ".before-handoff").read())[0] == parsed["ltk"]
+        # The keyboard paired anew under its next address: BlueZ's settings
+        # for the old one carry over, its keys don't, and it stays as it is.
+        with open(path, "a") as f:
+            f.write("[DeviceID]\nSource=2\n")
+        before = open(path).read()
+        moved = dict(parsed, peer="C0:00:00:00:00:02", ltk="CD" * 16)
+        try:
+            import_bond(moved, tmp, False, like="C0:00:00:00:00:09")
+            raise AssertionError("took the settings of a device BlueZ doesn't know")
+        except HandOffError:
+            pass
+        assert "with the settings of C0:00:00:00:00:01" in import_bond(moved, tmp, False, like="C0:00:00:00:00:01")
+        new = open(os.path.join(tmp, moved["adapter"], moved["peer"], "info")).read()
+        assert "[DeviceID]\nSource=2" in new and "Name=Bluetooth keyboard" in new and current_key(new)[0] == "CD" * 16 and "AB" * 16 not in new, new
+        assert open(path).read() == before
     print("selftest passed")
 
 
@@ -359,6 +390,7 @@ def main(argv):
         var = option("--var", EFIVAR)
         out = option("--out")
         bluez = option("--bluez", "/var/lib/bluetooth")
+        like = option("--like")
         dry_run = flag("--dry-run")
         if len(argv) != 3:
             print(__doc__, file=sys.stderr)
@@ -388,7 +420,7 @@ def main(argv):
                 write_private(out, bond_file_text(bond))
                 print(f"bond for {bond['peer']} on {bond['adapter']} written to {out} (mode 600)")
             else:
-                print(import_bond(bond, bluez, dry_run))
+                print(import_bond(bond, bluez, dry_run, like.upper() if like else None))
         else:
             print(__doc__, file=sys.stderr)
             return 2

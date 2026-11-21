@@ -48,6 +48,23 @@ make_esp () {
   } > "$esp/startup.nsh"
 }
 
+# The UEFI shell script of a pairing run on the real keyboard
+# (PAIR=1 scripts/qemu-hw-boot.sh): it saves the bond the driver hands to
+# the OS (BtKbHandOff, encrypted) where the host can pick it up. Without
+# one nothing was paired, there is no keyboard to end the session with,
+# and the script ends it. (dmpstore's status tells: it leaves an empty file
+# behind when it finds no such variable.)
+write_pair_nsh () {
+  printf '%s\r\n' '@echo -off' \
+    "dmpstore BtKbHandOff -guid $DIAG_GUID -s handoff.bin" \
+    'if %lasterror% ne 0 then' \
+    '  echo "=== no keyboard was paired: ending the session"' \
+    '  reset -s' \
+    'endif' \
+    'echo "=== paired: the bond for the OS is saved"' \
+    'echo "Type on the Bluetooth keyboard now. To end the session: reset, then Enter."' > "$1"
+}
+
 # A FAT32 disk image with the contents of a directory, attached as
 # virtio-blk. With the emulated SATA disk (fat:rw: or an image), OVMF hung
 # at boot or timed out reading files now and then, Bluetooth driver or not.

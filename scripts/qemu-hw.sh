@@ -14,7 +14,9 @@
 # script), EXTRA_ESP_FILES="file ..." (more files for the ESP),
 # QEMU_TIMEOUT=seconds (default 300), VARS_FILE=path (an OVMF variable
 # store to use and keep, instead of a fresh one), EXTRA_QEMU_ARGS="...",
-# START_MESSAGE="..." (shown once the host has let go of the controller).
+# START_MESSAGE="..." (shown once the host has let go of the controller),
+# NO_BOND=1 (the exported bond stays off the ESP), ESP_SAVE="name ..."
+# (files the guest wrote to the ESP, copied to qemu/hw/ after the run).
 # The bt-kb-dxe driver's log (QEMU debug console, port 0x402) ends up in
 # qemu/hw/driver.log.
 # SB=1: Secure Boot on, with throwaway test keys and signed images (see
@@ -136,7 +138,7 @@ for extra in ${EXTRA_ESP_FILES:-}; do
 done
 # Keyboard bonds exported by scripts/export-bond.sh (bt-kb-probe, bt-kb-dxe).
 for bond in "$ROOT"/qemu/keys/*.bond; do
-  [ -f "$bond" ] && install -m 600 "$bond" "$work/esp/"
+  [ -z "${NO_BOND:-}" ] && [ -f "$bond" ] && install -m 600 "$bond" "$work/esp/"
 done
 vars="${VARS_FILE:-$work/OVMF_VARS.4m.fd}"
 [ -n "${VARS_FILE:-}" ] || fresh_vars "$vars"
@@ -157,10 +159,14 @@ if [ -n "$window" ]; then
   display_args=(-display gtk,window-close=off,show-menubar=off -name "bt-kb-dxe: Bluetooth keyboard test"
     -device usb-tablet,bus=xhci.0 -serial file:"$work/serial.log" -monitor none -parallel none)
 fi
+# pipeline=off: QEMU completes the controller's reads one by one. A QEMU
+# built with the project's local patch then keeps data that arrives on a
+# read the guest has cancelled for its next read; QEMU as released drops
+# it (a GATT answer lost that way stalled three discoveries on Nov 21).
 qemu_args=(-machine "$machine" -cpu host -m 1G -no-reboot "${QEMU_FW[@]}"
   -drive if=none,id=esp,format=raw,file="$work/esp.img" -device virtio-blk-pci,drive=esp
   -device qemu-xhci,id=xhci
-  -device usb-host,bus=xhci.0,vendorid=0x0e8d,productid=0x0616
+  -device usb-host,bus=xhci.0,vendorid=0x0e8d,productid=0x0616,pipeline=off
   -chardev file,id=dbg,path="$work/driver.log" -device isa-debugcon,iobase=0x402,chardev=dbg
   ${EXTRA_QEMU_ARGS:-} -net none "${display_args[@]}")
 : > "$work/driver.log"
@@ -208,6 +214,11 @@ else
   clean_log "$work/serial.log" | sed -n '/^=== /,$p'
 fi
 chmod 600 "$work/serial.log"
+# (Private: what the guest saves may be a bond, sealed or not.)
+for name in ${ESP_SAVE:-}; do
+  rm -f "$work/$name"
+  (umask 077; mcopy -o -i "$work/esp.img" "::/$name" "$work/$name" 2>/dev/null) || true
+done
 if [ -z "$window" ] && [ -s "$work/driver.log" ]; then
   echo
   echo "--- bt-kb-dxe driver log"
