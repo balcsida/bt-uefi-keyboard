@@ -48,6 +48,41 @@ pub fn link_event(event: &[u8]) -> Option<LinkEvent> {
     }
 }
 
+/// A start fragment on the LE signaling channel with this code: its
+/// connection. (Handle and flags, length, L2CAP length, channel 5, code,
+/// identifier.)
+fn signal(packet: &[u8], code: u8) -> Option<u16> {
+    match *packet {
+        [h0, h1, _, _, _, _, 0x05, 0x00, c, _, ..] if c == code && (h1 >> 4) & 0b11 != 0b01 => Some(u16::from_le_bytes([h0, h1]) & 0x0FFF),
+        _ => None,
+    }
+}
+const SIGNAL_IDENTIFIER: usize = 9;
+
+/// A Connection Parameter Update Request in an ACL packet from the device
+/// (header included): its connection and its identifier.
+pub fn param_request(packet: &[u8]) -> Option<(u16, u8)> {
+    Some((signal(packet, 0x12)?, packet[SIGNAL_IDENTIFIER]))
+}
+
+/// If the ACL packet the host is about to send is the Connection Parameter
+/// Update Response on `request`'s connection, give it the request's
+/// identifier, and say so.
+///
+/// TrouBLE 0.8 numbers these responses by itself (1, 2, 3, ...; its
+/// `send_conn_param_update_res`), and a device drops a response that
+/// doesn't carry its request's identifier. The real keyboard then waited
+/// 60 s for one and ended the link (every "idle disconnect" from Nov 1 to
+/// Nov 21), and asked for nothing further meanwhile; once, in a boot's
+/// second connection, the numbers happened to agree (Nov 3).
+pub fn answer_param_request(packet: &mut [u8], request: (u16, u8)) -> bool {
+    let ours = signal(packet, 0x13) == Some(request.0);
+    if ours {
+        packet[SIGNAL_IDENTIFIER] = request.1;
+    }
+    ours
+}
+
 /// What an event means for an HCI_Disconnect the host sent for one handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisconnectStep {
@@ -120,6 +155,34 @@ pub fn notification(packet: &[u8]) -> Option<Notification<'_>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_parameter_response_gets_its_requests_identifier() {
+        // The keyboard asks on connection 0x0200, with identifier 0x2A
+        // (25-45 ms, latency 4, 2 s).
+        let asked = [0x00, 0x22, 0x10, 0x00, 0x0C, 0x00, 0x05, 0x00, 0x12, 0x2A, 8, 0, 20, 0, 36, 0, 4, 0, 200, 0];
+        assert_eq!(param_request(&asked), Some((0x0200, 0x2A)));
+        // The host stack answers "accepted" with a number of its own.
+        let answer = [0x00, 0x02, 0x0A, 0x00, 0x06, 0x00, 0x05, 0x00, 0x13, 0x01, 2, 0, 0, 0];
+        let mut sent = answer;
+        assert!(answer_param_request(&mut sent, (0x0200, 0x2A)));
+        assert_eq!(sent[9], 0x2A);
+        assert_eq!((&sent[..9], &sent[10..]), (&answer[..9], &answer[10..]));
+        // Nothing else is touched: another connection's answer, an ATT
+        // Write Response (also 0x13, on channel 4), a continuation
+        // fragment, the request itself.
+        let mut other = answer;
+        other[0] = 0x01;
+        let mut att = [0x00, 0x02, 0x05, 0x00, 0x01, 0x00, 0x04, 0x00, 0x13];
+        let mut continued = answer;
+        continued[1] = 0x12;
+        for packet in [&mut other[..], &mut att[..], &mut continued[..], &mut asked.clone()[..]] {
+            let before = packet.to_vec();
+            assert!(!answer_param_request(packet, (0x0200, 0x2A)));
+            assert_eq!(packet, &before[..]);
+        }
+        assert_eq!((param_request(&answer), param_request(&att), param_request(&asked[..9])), (None, None, None));
+    }
 
     #[test]
     fn connection_events_from_the_keyboard_trace() {

@@ -190,6 +190,9 @@ pub struct Inbox {
     /// made progress.
     writes: core::cell::Cell<u32>,
     dropped: core::cell::Cell<u32>,
+    /// The device's Connection Parameter Update Request the host stack
+    /// hasn't answered yet: connection and identifier.
+    param_request: core::cell::Cell<Option<(u16, u8)>>,
 }
 
 impl Inbox {
@@ -202,6 +205,9 @@ impl Inbox {
     }
 
     pub fn push_acl(&self, packet: &[u8]) {
+        if let Some(request) = crate::link::param_request(packet) {
+            self.param_request.set(Some(request));
+        }
         self.push(PacketKind::AclData, packet);
     }
 
@@ -273,6 +279,13 @@ impl Transport for InboxTransport<'_> {
             return Err(TransportError::Unsupported);
         }
         tx.write_hci(&mut buf[..size]).map_err(|_| TransportError::Parse)?;
+        // TrouBLE 0.8 numbers its Connection Parameter Update Responses by
+        // itself (see `link::answer_param_request`).
+        if let (PacketKind::AclData, Some(request)) = (P::KIND, self.inbox.param_request.get()) {
+            if crate::link::answer_param_request(&mut buf[..size], request) {
+                self.inbox.param_request.set(None);
+            }
+        }
         if let Some(guard) = self.guard {
             match P::KIND {
                 // Refused: the host stack gets an error and stops, so the
