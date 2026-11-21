@@ -9,6 +9,7 @@ extern crate alloc;
 #[macro_use]
 pub mod output;
 pub mod aclstream;
+pub mod adv;
 pub mod app;
 pub mod att;
 pub mod bootrec;
@@ -18,6 +19,7 @@ pub mod clock;
 pub mod embassy;
 pub mod eventlog;
 pub mod gatt_cache;
+pub mod handoff;
 pub mod emergency;
 pub mod hid;
 pub mod keymap;

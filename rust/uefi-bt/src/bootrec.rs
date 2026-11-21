@@ -30,6 +30,8 @@ pub struct BootRecord {
     pub failure: Option<(u64, String)>,
     /// Where the bond came from (`bondstore::Source::text`).
     pub bond: Option<&'static str>,
+    /// What became of pairing in firmware, if this boot offered it.
+    pub pairing: Option<&'static str>,
     /// Why the sealed bond (stage 4) couldn't be used, if there was one.
     /// `scripts/tpm-seal.sh --if-needed` reseals when it sees this.
     pub unseal_failed: Option<&'static str>,
@@ -94,6 +96,9 @@ impl BootRecord {
         }
         if let Some(source) = self.bond {
             let _ = write!(s, "; bond {source}");
+        }
+        if let Some(outcome) = self.pairing {
+            let _ = write!(s, "; pairing {outcome}");
         }
         match self.tpm_separators {
             Some(None) => s.push_str("; no TPM"),
@@ -273,6 +278,12 @@ mod tests {
             ..BootRecord::default()
         };
         assert!(r.render().starts_with("loaded 9.49 s after reset by the firmware; unseal failed: the PCRs changed since sealing; bond stored;"));
+    }
+
+    #[test]
+    fn pairing_in_firmware() {
+        let r = BootRecord { loaded_at_ms: 320, bond: Some("none"), pairing: Some("offered, nothing paired"), ..BootRecord::default() };
+        assert!(r.render().starts_with("loaded 0.32 s after reset by the firmware; bond none; pairing offered, nothing paired;"));
     }
 
     #[test]
