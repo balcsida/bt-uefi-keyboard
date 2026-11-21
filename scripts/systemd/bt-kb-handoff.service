@@ -1,0 +1,30 @@
+# Give the bond bt-kb-dxe made by pairing in firmware to BlueZ, before
+# bluetoothd starts (README, Pairing in firmware). The keyboard holds one
+# key per host, so the OS has to use the driver's bond and must not pair
+# again. The driver hands it over at every boot, encrypted to the key in
+# /etc/bt-kb/handoff.key, in the variable BtKbHandOff; this writes it into
+# BlueZ's key store if it isn't the one there already. A no-op at boots
+# without a hand-off, and with the bond already in place.
+#
+# Once, as root (the public key it prints goes into the driver's build):
+#   install -d -m 700 /etc/bt-kb
+#   python3 -I @REPO@/scripts/bond-handoff.py keygen /etc/bt-kb/handoff.key
+# Then install the unit, with this repository's path in place of @REPO@:
+#   sudo sed 's|@REPO@|/path/to/bt-uefi-keyboard|' scripts/systemd/bt-kb-handoff.service \
+#     > /etc/systemd/system/bt-kb-handoff.service
+#   sudo systemctl daemon-reload && sudo systemctl enable bt-kb-handoff.service
+
+[Unit]
+Description=Take over the Bluetooth keyboard bond made by bt-kb-dxe
+Documentation=file://@REPO@/README.md
+ConditionPathExists=/etc/bt-kb/handoff.key
+ConditionPathExists=/sys/firmware/efi/efivars/BtKbHandOff-5223227b-ac96-454e-9bca-f15199748a3c
+RequiresMountsFor=/var/lib/bluetooth @REPO@
+Before=bluetooth.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I @REPO@/scripts/bond-handoff.py import /etc/bt-kb/handoff.key
+
+[Install]
+WantedBy=bluetooth.service multi-user.target
