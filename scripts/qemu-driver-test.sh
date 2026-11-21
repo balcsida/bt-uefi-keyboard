@@ -43,6 +43,38 @@
 #      uses its boot-services copy, until --if-needed reseals; a corrupted
 #      seal fails cleanly; without a TPM the copy is used; with fallback=no
 #      the copy is deleted, and a seal that then fails leaves no key.
+#
+# From here on the driver has a controller and a keyboard: the emulated ones
+# of rust/bt-emu, which QEMU attaches as a usb-redir device. The driver is
+# the same binary, and nothing touches a real radio.
+#  13. a session: the keyboard is woken by typing, connects, is encrypted
+#      with the test bond and discovered while more is typed; the shell runs
+#      what was typed, in order. The keyboard's parameter request is
+#      accepted, a media key ignored; it goes to sleep, and the next keys
+#      bring it back.
+#  14. at boot (Driver####), two boots: the layout is discovered and
+#      remembered; at the second boot F2 from the keyboard opens OVMF's
+#      boot menu, with the stored bond, the remembered layout and a
+#      controller that reports encryption with version 1 of the event.
+#  15. keys only from the bonded keyboard on an encrypted link (stage 1),
+#      three boots: reports sent before the encryption and pairing packets
+#      from the keyboard are dropped; a keyboard without the key, or with
+#      another one, gets no encryption, no pairing, and types nothing.
+#  16. the ACL reader against a real USB stack: two reports in one USB
+#      transfer, and reports split across transfers (once inside the ACL
+#      header), still arrive whole and in order.
+#  17. held keys: Enter acts once; a key whose release never arrives repeats
+#      until the next key press, and the driver says so.
+#  18. bring-up refusals: firmware that isn't loaded on the chip; a bond
+#      that belongs to another controller. The driver tries twice, then
+#      leaves the controller alone for the rest of the boot.
+#  19. how a session ends: ExitBootServices with a live link (the keyboard
+#      is disconnected, the controller handed back); the controller
+#      unplugged under the driver.
+#  20. what a scan hears (bt-le-scan.efi): nothing from a sleeping
+#      keyboard; a woken one directed at its bonded host, then undirected
+#      with the HID service; one in pairing mode with its name in the scan
+#      response.
 # The driver's log (QEMU debug console, port 0x402) is shown after each run.
 # ONLY="1 3" runs just those cases.
 #
@@ -63,18 +95,59 @@ test_digest="$(python3 -I "$ROOT/scripts/bond-digest.py" "$work/test.bond")"
 # btlog gets -unseal-test here (case 12), and only here.
 (cd "$ROOT/rust" && BT_KB_FIRMWARE="$FW_BIN" BT_KB_BOND_DIGESTS="$test_digest" \
   cargo build --quiet --release --target x86_64-unknown-uefi --target-dir "$ROOT/rust/target/offline-test" \
-  -p bt-kb-dxe -p bt-kb-log -p ebs-test --features bt-kb-log/unseal-test) || { echo "building the test driver failed" >&2; exit 1; }
+  -p bt-kb-dxe -p bt-kb-log -p ebs-test -p bt-le-scan --features bt-kb-log/unseal-test) || { echo "building the test driver failed" >&2; exit 1; }
 RUST_EFI_DIR="$ROOT/rust/target/offline-test/x86_64-unknown-uefi/release"
 # What scripts/tpm-seal.sh --build reads.
 echo "$test_digest" > "$RUST_EFI_DIR/bt-kb-dxe.bonds"
 echo "spare_pcr=8" > "$RUST_EFI_DIR/bt-kb-dxe.tpm"
 DRIVER="$RUST_EFI_DIR/bt-kb-dxe.efi"
-trap 'pkill -f "qemu-system-x86_64 .*${work}/" 2>/dev/null || true; for d in "$work"/*/tpm; do [ -d "$d" ] && tpm_stop "$d"; done' EXIT
+# The emulated controller and keyboard of cases 13 and up: a host program.
+(cd "$ROOT/rust" && cargo build --quiet -p bt-emu) || { echo "building bt-emu failed" >&2; exit 1; }
+EMU="$ROOT/rust/target/debug/bt-emu"
+emu_pid=""
+trap 'pkill -f "qemu-system-x86_64 .*${work}/" 2>/dev/null || true; [ -z "$emu_pid" ] || kill "$emu_pid" 2>/dev/null || true; for d in "$work"/*/tpm; do [ -d "$d" ] && tpm_stop "$d"; done' EXIT
 if [ -n "${SB:-}" ]; then
   sb_prepare
 fi
 
+# emu_start DIR SCRIPT: the emulated controller and keyboard for one QEMU
+# run, with the test bond as what the keyboard remembers. Its log is
+# DIR/emu.log. Sets emu_sock (for QEMU's chardev) and emu_pid.
+emu_start () {
+  local i
+  emu_sock="$1/emu.sock"
+  # A Unix socket's path can't be much longer than 100 bytes.
+  [ "${#emu_sock}" -lt 100 ] || emu_sock="$(mktemp -u /tmp/bt-emu.XXXXXX)"
+  rm -f "$emu_sock"
+  "$EMU" --socket "$emu_sock" --bond "$work/test.bond" --script "$2" --log "$1/emu.log" --quiet --timeout 170 &
+  emu_pid=$!
+  for i in $(seq 1 50); do
+    [ -S "$emu_sock" ] && return 0
+    sleep 0.1
+  done
+  echo "bt-emu didn't start (see $1/emu.log)" >&2
+  return 1
+}
+
+# It ends by itself when QEMU closes the connection. Sets emu_status: 1 if
+# a step of its script failed.
+emu_stop () {
+  local i
+  emu_status=0
+  [ -n "$emu_pid" ] || return 0
+  for i in $(seq 1 30); do
+    kill -0 "$emu_pid" 2>/dev/null || break
+    sleep 0.1
+  done
+  kill "$emu_pid" 2>/dev/null || true
+  wait "$emu_pid" 2>/dev/null || emu_status=$?
+  emu_pid=""
+  rm -f "$emu_sock"
+}
+
 # KEEP_VARS=1: use the variable store already there; EXTRA_QEMU: more args.
+# EMU_SCRIPT=FILE: with the emulated controller and keyboard, doing what
+# FILE says (rust/bt-emu/src/script.rs).
 # The TPM (TPM=1) keeps its state in $work/NAME/tpm.
 #
 # With a TPM, about one boot in ten hangs in the firmware: QEMU's TPM
@@ -84,7 +157,8 @@ fi
 # TPM boot that times out is retried from the same variable store and TPM
 # state, twice at most; "TPM boot hung, retrying" lines count them.
 run_qemu () {
-  local name="$1" d="$work/$1" status=0 attempt tries=1 limit=120
+  local name="$1" d="$work/$1" status=0 attempt tries=1 limit=120 emu=()
+  emu_status=0
   [ -n "${KEEP_VARS:-}" ] || fresh_vars "$d/OVMF_VARS.4m.fd"
   if [ -n "${TPM:-}" ]; then
     tries=3
@@ -98,12 +172,17 @@ run_qemu () {
     : > "$d/driver.log"
     tpm_start "$d/tpm"
     qemu_fw "$d/OVMF_VARS.4m.fd"
+    if [ -n "${EMU_SCRIPT:-}" ]; then
+      emu_start "$d" "$EMU_SCRIPT"
+      emu=(-chardev "socket,id=emu,path=$emu_sock" -device usb-redir,chardev=emu,bus=xhci.0)
+    fi
     status=0
     timeout --foreground "$limit" "$QEMU" -machine "q35,$QEMU_MACHINE" -cpu host -m 1G -nographic -no-reboot "${QEMU_FW[@]}" \
       -drive if=none,id=esp,format=raw,file="$d/esp.img" -device virtio-blk-pci,drive=esp \
-      -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 \
+      -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 "${emu[@]}" \
       -chardev file,id=dbg,path="$d/driver.log" -device isa-debugcon,iobase=0x402,chardev=dbg \
       ${EXTRA_QEMU:-} -net none -serial mon:stdio > "$d/serial.log" 2>&1 || status=$?
+    if [ -n "${EMU_SCRIPT:-}" ]; then emu_stop; fi
     if [ -n "${TPM:-}" ]; then tpm_stop "$d/tpm"; fi
     if [ "$status" != 124 ] || [ "$attempt" = "$tries" ]; then
       break
@@ -115,7 +194,11 @@ run_qemu () {
   done
   rm -rf "$d/.vars.before" "$d/.tpm.before"
   [ "$status" = 0 ] || echo "(QEMU exit status $status)"
+  [ "$emu_status" = 0 ] || echo "(bt-emu exit status $emu_status)"
 }
+
+# check WHAT CONDITION: one line, "WHAT: yes" or "WHAT: NO".
+check () { if eval "$2"; then echo "  $1: yes"; else echo "  $1: NO"; fi; }
 
 # The test bond, for runs that never talk to a keyboard.
 fake_bond () {
@@ -416,7 +499,6 @@ boot () { # boot N: one boot; its logs kept as N.*
   # The driver deletes imported files from the image; mirror that.
   mdir -i "$b/esp.img" -b ::/ 2>/dev/null | sed 's|^::/||' > "$b/$1.files"
 }
-check () { if eval "$2"; then echo "  $1: yes"; else echo "  $1: NO"; fi; }
 planted_bond "$b/esp" other.bond
 boot 1
 check "1. a planted bond for another device is refused" "grep -q 'other.bond is a bond this driver wasn.t built for' $b/1.driver.log && grep -q 'no bond:' $b/1.driver.log"
@@ -498,7 +580,6 @@ else
       --driver "$t/esp/bt-kb-dxe.efi" --out "$t/esp/bt-kb-dxe.sealed" "$@" 2>&1 | sed 's/^/    /'
     tpm_host_stop "$t/tpm"
   }
-  check () { if eval "$2"; then echo "  $1: yes"; else echo "  $1: NO"; fi; }
   mkdir -p "$t/no-efivars"
 
   boot12 1
@@ -574,4 +655,428 @@ PY
     if grep -qE 'PANIC|panicked' "$t/$n.driver.log"; then echo "  boot $n: PANIC in the driver log"; fi
   done
 fi
+fi
+
+# ----- With the emulated controller and keyboard (rust/bt-emu) -----------
+
+# emu_esp NAME: an ESP whose shell loads the driver and stays at its prompt,
+# for the keyboard to type at.
+emu_esp () {
+  new_esp "$1"
+  cp "$FW_BIN" "$(img "$RUST_EFI_DIR/ebs-test.efi")" "$work/$1/esp/"
+  fake_bond "$work/$1/esp"
+  printf '%s\r\n' '@echo -off' 'fs0:' 'echo "=== load"' 'load bt-kb-dxe.efi' 'echo "=== loaded"' > "$work/$1/esp/startup.nsh"
+}
+
+# What the shell showed once the driver was loaded, into NAME/shell.txt.
+shell_after_load () {
+  clean_log "$work/$1/serial.log" | sed -n '/^=== loaded/,$p' > "$work/$1/shell.txt"
+}
+
+# The emulator's verdict on its script: the steps that failed, and whether
+# it ran to its end.
+emu_verdict () {
+  local log="$work/$1/emu.log"
+  grep 'FAILED' "$log" | sed 's/^ *[0-9]* /  emulator: /' || true
+  check "the emulator's script ran to its end, every expectation held" "grep -q 'summary: script: ran to its end, 0 failed' $log"
+}
+
+# Every key report the keyboard sent was counted by the driver. (The
+# release of the Enter that resets the machine can come too late.)
+key_counts () {
+  local sent got
+  sent="$(sed -n 's/.* \([0-9]*\) key reports sent.*/\1/p' "$work/$1/emu.log" | tail -1)"
+  got="$(sed -n 's/.*controller handed back (\([0-9]*\) key reports this session).*/\1/p' "$work/$1/driver.log" | tail -1)"
+  check "every key report arrived (${got:-?} of ${sent:-?})" "[ -n '$sent' ] && [ -n '$got' ] && { [ '$got' = '$sent' ] || [ '$got' = '$((${sent:-0} - 1))' ]; }"
+}
+
+# The driver's log without the lines every run has.
+driver_log () {
+  grep -vE 'key notify [0-9]+ registered|timing \(' "$work/$1/driver.log" || true
+}
+
+if want 13; then
+echo
+echo "##### 13. emulated keyboard: connect, encrypt, discover, type; sleep and come back"
+emu_esp emu-session
+s="$work/emu-session"
+cat > "$s/emu.script" <<'EOF'
+# A first connection: keys are typed while the driver discovers the keyboard.
+set param-after 1500
+set idle 4000
+wait initiating 30000
+sleep 200
+type echo EMU-TYPED-1{enter}
+wait encrypted 10000
+wait sent 20000
+wait att-quiet-ms >= 400 20000
+expect connections = 1
+expect encryptions = 1
+expect smp-from-host = 0
+expect unknown-commands = 0
+expect keys-notifying = 1
+wait param-accepted >= 1 10000
+wait connection-updates >= 1 5000
+media ea
+wait sent 5000
+# The keyboard goes to sleep. The next keys wake it, and arrive.
+wait disconnected 15000
+expect kbd-disconnects = 1
+sleep 300
+type echo SECOND Line 2!{enter}
+wait connections >= 2 10000
+wait sent 20000
+sleep 600
+expect encryptions = 2
+type reset -s{enter}
+wait sent 5000
+EOF
+EMU_SCRIPT="$s/emu.script" run_qemu emu-session
+shell_after_load emu-session
+sed -n '2,6p' "$s/shell.txt"
+check "typed during discovery, and run in order" "grep -qx 'EMU-TYPED-1' $s/shell.txt"
+check "typed after the keyboard slept and came back" "grep -qx 'SECOND Line 2!' $s/shell.txt"
+check "encrypted with the bonded key twice, the host stack agreeing" \
+  "[ \$(grep -c 'keyboard link encrypted with the bonded key' $s/driver.log) = 2 ] && [ \$(grep -c 'encryption confirmed by the host stack' $s/driver.log) = 2 ]"
+check "the layout discovered and remembered" "grep -q 'keyboard layout remembered for the next boots' $s/driver.log"
+check "the keyboard's parameter request accepted" \
+  "grep -q 'asked for new connection parameters (interval 25 ms-45 ms, latency 4, timeout 2000 ms): accepted' $s/driver.log"
+check "a media key ignored" "grep -q 'report on handle 0x0016 ignored (not the keyboard report): ea 00' $s/driver.log"
+check "the keyboard's idle disconnect seen" "grep -q 'keyboard disconnected (reason 0x13)' $s/driver.log"
+check "no report dropped, no command refused, no panic" "! grep -qE 'dropped|refused to send|PANIC' $s/driver.log"
+key_counts emu-session
+emu_verdict emu-session
+echo "--- driver log"
+driver_log emu-session
+fi
+
+if want 14; then
+echo
+echo "##### 14. emulated keyboard at boot (Driver####): F2 opens the boot menu; stored bond, remembered layout"
+new_esp emu-hotkey
+h="$work/emu-hotkey"
+cp "$FW_BIN" "$h/esp/"
+fake_bond "$h/esp"
+printf '%s\r\n' '@echo -off' 'fs0:' 'echo "=== shell reached"' 'reset -s' > "$h/esp/startup.nsh"
+fresh_vars "$h/OVMF_VARS.4m.fd"
+add_driver_option "$h/OVMF_VARS.4m.fd" || echo "adding the Driver#### option FAILED"
+cat > "$h/emu.script" <<'EOF'
+# First boot: the keyboard connects, and its layout is discovered.
+wait initiating 30000
+wake
+wait encrypted 10000
+wait att-quiet-ms >= 400 20000
+expect keys-notifying = 1
+EOF
+KEEP_VARS=1 EMU_SCRIPT="$h/emu.script" run_qemu emu-hotkey
+cp "$h/driver.log" "$h/1.driver.log"
+cp "$h/emu.log" "$h/1.emu.log"
+check "first boot: bond imported, layout discovered and remembered" \
+  "grep -q 'bond imported into a variable' $h/1.driver.log && grep -q 'keyboard layout remembered for the next boots' $h/1.driver.log"
+# The driver deleted the imported bond file from the image; mirror that.
+rm -f "$h/esp/test.bond"
+cat > "$h/emu.script" <<'EOF'
+# Second boot: F2 in the boot countdown, on a controller that reports
+# encryption the old way; then the second entry of the boot menu.
+set encryption-change-v1 1
+wait initiating 30000
+type {f2}
+wait encrypted 10000
+wait sent 5000
+sleep 3000
+type {down}{enter}
+wait sent 5000
+EOF
+KEEP_VARS=1 EXTRA_QEMU="-boot menu=on,splash-time=8000" EMU_SCRIPT="$h/emu.script" run_qemu emu-hotkey
+clean_log "$h/serial.log" > "$h/serial.txt"
+check "boot menu: opened by the keyboard's F2" "grep -q 'Please select boot device' $h/serial.txt"
+check "the menu's second entry started the shell" "grep -q '^=== shell reached' $h/serial.txt"
+check "the stored bond and the remembered layout were used" \
+  "grep -q '(stored)' $h/driver.log && grep -q 'using the keyboard layout remembered from an earlier boot' $h/driver.log && grep -q 'the remembered keyboard layout still matches' $h/driver.log"
+check "Encryption Change v1 understood" "grep -q 'keyboard link encrypted with the bonded key (Encryption Change v1)' $h/driver.log"
+check "F2 ran the boot manager's hotkey" "grep -q 'key F2 delivered (1 key notify functions ran)' $h/driver.log"
+emu_verdict emu-hotkey
+echo "--- driver log of the second boot"
+driver_log emu-hotkey
+fi
+
+if want 15; then
+echo
+echo "##### 15. emulated keyboard, stage 1: keys only from the bonded keyboard on an encrypted link"
+# a. An attacker in radio range: key reports before the link is encrypted,
+#    and pairing packets before and after.
+emu_esp emu-attack
+a="$work/emu-attack"
+cat > "$a/emu.script" <<'EOF'
+set encrypt-delay 1200
+wait initiating 30000
+wake
+wait connected 10000
+attack-type echo PWNED-A{enter}
+# SMP Security Request, then (on the encrypted link) a Pairing Request.
+l2cap 0006 0b 01
+wait encrypted 10000
+wait att-quiet-ms >= 400 20000
+l2cap 0006 01 03 00 01 10 07 07
+type echo OK-A{enter}
+wait sent 10000
+sleep 500
+expect smp-from-host = 0
+expect encryptions = 1
+type reset -s{enter}
+wait sent 5000
+EOF
+EMU_SCRIPT="$a/emu.script" run_qemu emu-attack
+shell_after_load emu-attack
+check "a. reports from before the encryption never reached the shell" "! grep -q PWNED $a/shell.txt && grep -q 'dropped 26 key reports that arrived before the link was encrypted' $a/driver.log"
+check "   the keyboard's own typing did" "grep -qx 'OK-A' $a/shell.txt"
+check "   pairing packets from the keyboard dropped, none answered" "grep -q 'dropped a pairing (SMP) packet' $a/driver.log && grep -q ' 0 pairing packets from the host' $a/emu.log"
+emu_verdict emu-attack
+
+# b. The keyboard has no key for this host (reset, or paired with another
+#    computer), and what it sends is typed anyway by whoever holds it.
+emu_esp emu-nokey
+n="$work/emu-nokey"
+printf '12' > "$n/esp/bt-kb-dxe.timelimit"
+cat > "$n/emu.script" <<'EOF'
+set bond none
+wait initiating 30000
+wake
+wait connected 10000
+wait refused >= 1 10000
+attack-type echo PWNED-B{enter}
+sleep 4000
+expect smp-from-host = 0
+expect encryptions = 0
+EOF
+EMU_SCRIPT="$n/emu.script" run_qemu emu-nokey
+shell_after_load emu-nokey
+check "b. a keyboard without the key: no encryption, nothing typed" \
+  "! grep -q PWNED $n/shell.txt && grep -q 'keyboard session ended: the keyboard rejected the stored key' $n/driver.log && grep -q 'controller handed back (0 key reports this session)' $n/driver.log"
+check "   the host stack wanted to pair afresh; no pairing packet left the driver" \
+  "grep -q 'initiating fresh pairing' $n/driver.log && grep -q ' 0 pairing packets from the host' $n/emu.log"
+check "   its reports dropped and counted" "grep -q 'key reports arrived on that connection before it was encrypted, and were dropped' $n/driver.log"
+emu_verdict emu-nokey
+
+# c. The keyboard's key differs from the driver's.
+emu_esp emu-wrongkey
+k="$work/emu-wrongkey"
+printf '8' > "$k/esp/bt-kb-dxe.timelimit"
+cat > "$k/emu.script" <<'EOF'
+set bond wrong-key
+wait initiating 30000
+wake
+wait mic-failures >= 1 10000
+sleep 2500
+expect encryptions = 0
+expect smp-from-host = 0
+EOF
+EMU_SCRIPT="$k/emu.script" run_qemu emu-wrongkey
+check "c. another key: the link is lost at the encryption, nothing typed" \
+  "grep -q 'keyboard disconnected (reason 0x3d)' $k/driver.log && grep -q 'controller handed back (0 key reports this session)' $k/driver.log"
+emu_verdict emu-wrongkey
+echo "--- driver log of a."
+driver_log emu-attack
+echo "--- driver log of b. (first connection)"
+driver_log emu-nokey | sed -n '/waiting for the keyboard/,/key reports arrived on that connection/p' | head -12
+fi
+
+if want 16; then
+echo
+echo "##### 16. emulated keyboard: reports merged into one USB transfer and split across transfers"
+emu_esp emu-shaping
+g="$work/emu-shaping"
+cat > "$g/emu.script" <<'EOF'
+wait initiating 30000
+wake
+wait encrypted 10000
+wait att-quiet-ms >= 400 20000
+type echo M
+wait sent 5000
+# A press and its release in one transfer.
+set acl-merge 2
+type e
+wait sent 5000
+# A report cut after the ACL header and three bytes; then inside the header.
+set acl-split 7
+type r
+wait sent 5000
+set acl-split 3
+type g
+wait sent 5000
+set acl-merge 3
+type ed{enter}
+wait sent 5000
+expect merged = 2
+expect split = 2
+sleep 500
+type reset -s{enter}
+wait sent 5000
+EOF
+EMU_SCRIPT="$g/emu.script" run_qemu emu-shaping
+shell_after_load emu-shaping
+check "every key arrived, in order" "grep -qx 'Merged' $g/shell.txt"
+check "the driver saw both layouts" \
+  "grep -q 'ACL pipe so far: 2 transfers held more than one packet, 2 packets spanned transfers' $g/driver.log && ! grep -q 'out of step' $g/driver.log"
+key_counts emu-shaping
+emu_verdict emu-shaping
+grep -o 'summary: usb.*' "$g/emu.log" | sed 's/^/  emulator /'
+fi
+
+if want 17; then
+echo
+echo "##### 17. emulated keyboard: held keys, and a key whose release never arrives"
+emu_esp emu-repeat
+r="$work/emu-repeat"
+cat > "$r/emu.script" <<'EOF'
+wait initiating 30000
+wake
+wait encrypted 10000
+wait att-quiet-ms >= 400 20000
+# Enter held for 2 s.
+type echo X
+wait sent 5000
+hold 28 2000
+wait sent 5000
+sleep 300
+# 'a' goes down and its release is lost; 2 s later 'b' is pressed.
+type echo{space}
+wait sent 5000
+report 00 04
+wait sent 5000
+sleep 2000
+report 00 05
+report 00
+wait sent 5000
+sleep 300
+type {enter}
+wait sent 5000
+sleep 500
+type reset -s{enter}
+wait sent 5000
+EOF
+EMU_SCRIPT="$r/emu.script" run_qemu emu-repeat
+shell_after_load emu-repeat
+check "Enter held for 2 s ran the command once" "[ \$(grep -cx 'X' $r/shell.txt) = 1 ] && [ \$(grep -c '^FS0:.> *$' $r/shell.txt) -le 1 ]"
+check "the key without a release repeated until the next key" "grep -qE '^a{40,}b$' $r/shell.txt"
+check "the driver flagged the lost release" \
+  "grep -q 'a key that had repeated for over 1.5 s stopped only when another key was pressed: its release report was probably lost (1 so far)' $r/driver.log"
+emu_verdict emu-repeat
+fi
+
+if want 18; then
+echo
+echo "##### 18. emulated controller: bring-up refusals"
+for which in nofw otheradapter; do
+  new_esp "emu-$which"
+  u="$work/emu-$which"
+  cp "$FW_BIN" "$u/esp/"
+  fake_bond "$u/esp"
+  printf '%s\r\n' '@echo -off' 'fs0:' 'echo "=== load"' 'load bt-kb-dxe.efi' 'echo "=== loaded"' 'reset -s' > "$u/esp/startup.nsh"
+  if [ "$which" = nofw ]; then
+    printf '%s\n' '# As after a power cut: the chip has lost its firmware patch.' 'set firmware-loaded 0' 'wait wmt-commands >= 1 30000' > "$u/emu.script"
+  else
+    printf '%s\n' '# The bond was made on another controller.' 'set bd-addr 02:00:00:00:00:03' 'wait hci-resets >= 1 30000' > "$u/emu.script"
+  fi
+  EMU_SCRIPT="$u/emu.script" run_qemu "emu-$which"
+done
+u="$work/emu-nofw"
+check "firmware not loaded: refused, nothing uploaded" \
+  "grep -q 'firmware section 0 is not loaded on the chip' $u/driver.log && ! grep -q 'a firmware section was uploaded' $u/emu.log && ! grep -q 'waiting for the keyboard' $u/driver.log"
+check "   tried twice, then left alone, with the controller handed back each time" \
+  "[ \$(grep -c 'is not loaded on the chip' $u/driver.log) = 2 ] && grep -q 'leaving it alone until the next boot' $u/driver.log && [ \$(grep -c 'Handoff: HCI_Reset + function off: ok' $u/driver.log) = 2 ]"
+emu_verdict emu-nofw
+u="$work/emu-otheradapter"
+check "a bond for another controller: refused" \
+  "grep -q 'this controller is 02:00:00:00:00:03, but the bond belongs to 02:00:00:00:00:02' $u/driver.log && ! grep -q 'waiting for the keyboard' $u/driver.log"
+emu_verdict emu-otheradapter
+fi
+
+if want 19; then
+echo
+echo "##### 19. emulated keyboard: how a session ends"
+# a. An OS starts while the keyboard is connected.
+emu_esp emu-ebs
+e="$work/emu-ebs"
+cat > "$e/emu.script" <<'EOF'
+set idle off
+wait initiating 30000
+wake
+wait encrypted 10000
+wait att-quiet-ms >= 400 20000
+type ebs-test.efi{enter}
+wait sent 5000
+# The hand-off: the keyboard disconnected, the controller reset and off.
+wait function-on = 0 15000
+expect host-disconnects = 1
+expect connected = 0
+EOF
+EMU_SCRIPT="$e/emu.script" run_qemu emu-ebs
+check "a. ExitBootServices: keyboard disconnected, controller handed back" \
+  "grep -q 'an OS is starting (ExitBootServices' $e/driver.log && grep -q 'disconnecting the keyboard (handle 0x0200)' $e/driver.log && grep -q 'Handoff: HCI_Reset + function off: ok' $e/driver.log"
+emu_verdict emu-ebs
+
+# b. The controller disappears under the driver (unplugged), while the
+#    shell is busy; the machine has to carry on.
+emu_esp emu-unplug
+p="$work/emu-unplug"
+printf '%s\r\n' 'stall 8000000' 'echo "=== still alive"' 'reset -s' >> "$p/esp/startup.nsh"
+cat > "$p/emu.script" <<'EOF'
+wait initiating 30000
+wake
+wait encrypted 10000
+wait att-quiet-ms >= 400 20000
+sleep 500
+quit
+EOF
+EMU_SCRIPT="$p/emu.script" run_qemu emu-unplug
+shell_after_load emu-unplug
+check "b. unplugged while connected: the driver stopped, the machine went on" \
+  "grep -q 'stop (0 children)' $p/driver.log && grep -q '^=== still alive' $p/shell.txt && ! grep -qE 'PANIC|panicked' $p/driver.log"
+emu_verdict emu-unplug
+echo "--- driver log of b. (from the unplugging)"
+driver_log emu-unplug | sed -n '/stop (/,$p'
+fi
+
+if want 20; then
+echo
+echo "##### 20. emulated keyboard: what a scan hears (bt-le-scan)"
+new_esp emu-scan
+c="$work/emu-scan"
+cp "$FW_BIN" "$(img "$RUST_EFI_DIR/bt-le-scan.efi")" "$c/esp/"
+fake_bond "$c/esp"
+printf '%s\r\n' '@echo -off' 'fs0:' 'echo "=== scan 1"' 'bt-le-scan.efi -t 4' 'echo "=== scan 2"' 'bt-le-scan.efi -t 3 -active -dups' \
+  'echo "=== done"' 'reset -s' > "$c/esp/startup.nsh"
+cat > "$c/emu.script" <<'EOF'
+# A passive scan, one report per kind of advertising: nothing from a
+# sleeping keyboard; woken, it advertises directed at its bonded host for
+# 1.28 s, then undirected.
+wait scanning 30000
+sleep 500
+expect adv-reports = 0
+wake
+wait adv-reports >= 2 5000
+wait scanning = 0 10000
+expect adv-reports = 2
+# An active scan with duplicates, the keyboard in pairing mode.
+wait scanning 30000
+pairing-mode
+wait scanning = 0 10000
+expect adv-reports >= 20
+expect connections = 0
+expect unknown-commands = 0
+EOF
+EMU_SCRIPT="$c/emu.script" run_qemu emu-scan
+clean_log "$c/serial.log" > "$c/serial.txt"
+sed -n '/^=== scan 1/,/^=== scan 2/p' "$c/serial.txt" > "$c/scan1.txt"
+sed -n '/^=== scan 2/,/^=== done/p' "$c/serial.txt" > "$c/scan2.txt"
+grep -E '^  [*+] |Scan summary|^  C0:|Bonded keyboard' "$c/scan1.txt" "$c/scan2.txt" | sed 's/^.*scan\([12]\)\.txt:/  scan \1: /' | head -24
+check "woken: directed at the bonded host first, then undirected with the HID service and the keyboard appearance" \
+  "grep -q '\* C0:00:00:00:00:01 (random) .*ADV_DIRECT_IND   <== bonded keyboard' $c/scan1.txt && grep -q '\* C0:00:00:00:00:01 (random) .*ADV_IND  HID  appearance 0x03c1' $c/scan1.txt"
+check "   one report of each, and the keyboard counted as seen" \
+  "grep -q 'Scan summary: 2 reports from 1 devices' $c/scan1.txt && grep -q 'Bonded keyboard C0:00:00:00:00:01: SEEN' $c/scan1.txt"
+check "pairing mode, active scan: its name from the scan response" \
+  "grep -q ' 1 devices' $c/scan2.txt && grep -q 'ADV_IND SCAN_RSP  \"Emulated Keyboard\"  HID' $c/scan2.txt && ! grep -q 'ADV_DIRECT_IND' $c/scan2.txt"
+check "both scans ended by themselves, the controller handed back" "grep -q '^=== done' $c/serial.txt && ! grep -qE 'Watchdog|PANIC|panicked' $c/serial.txt"
+emu_verdict emu-scan
 fi
