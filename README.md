@@ -18,6 +18,7 @@ tooling (UEFI shell, OVMF builds).
 | 3. Connect + encrypt with the exported LTK | Done (Nov 1): connected, encrypted with the exported legacy key, read the Report Map and decoded typing in report protocol ("hello uefi"). Boot protocol doesn't work on this keyboard. TrouBLE's queues were enlarged after bursts lost notifications; confirmed with fast typing (82 of 82 delivered). |
 | 4. Driver (`bt-kb-dxe.efi`) | Shell done on hardware (Nov 1): loaded from the shell, the driver made the Bluetooth keyboard a console keyboard, the wake keys were replayed, and the OS hand-off left Linux a working controller (setup 173 ms). Since then: started by a USB notify the moment the controller appears, refuses a second load, and remembers the keyboard's layout between boots (`BtKbGatt`). Offline, as a Driver#### at boot, its F2 opens OVMF's boot menu. **Done in OVMF on the real controller and keyboard (Nov 2):** loaded at boot, ready 0.65 s in; an F2 on the Bluetooth keyboard during the countdown opened the boot menu, delivered 180 ms after the keyboard connected (remembered layout); setup worked; Reset handed the controller back and Linux took over (setup 181 ms). |
 | 5. Real board (AMI Aptio) | **The firmware loads the driver at every boot (Nov 2)**, from a Driver#### entry with the firmware's full device path (it ignores efibootmgr's short form). AMI's USB stack works, and AMI signals BeforeExitBootServices: the driver hands the controller back when Linux starts. **Del on the Bluetooth keyboard gets into AMI setup, and typing works there.** The 4–6 s stalls of the first session (TrouBLE 0.8 handles only Encryption Change v1, the controller sends v2) are fixed and confirmed after a cold boot: one connection for the whole session. **Warm reboots failed because of AMI's Fast Boot**, which was on before the project: a fast boot skips Driver#### entries, so the driver never ran (22:52: boot loader after 10.7 s, against 14–15 s in full boots). With Fast Boot off, a warm reboot ran the driver (23:15): keys flowed into Limine, and the boot record (`BtKbLastBoot`), which survives boots that end early, worked. **The security-hardened driver runs on the board (Nov 3, Secure Boot off):** it imported the bond, overwrote and deleted the file on the ESP, and Linux can't see the stored copy. Its TPM log agrees with the firmware's event log (no separator measured before it), and it extends PCR 8, which nothing else uses. **Del into setup works with it too:** the bond came from the hidden variable, the first Del arrived 0.74 s after the driver loaded, and after the keyboard's idle disconnect the next key press reconnected it, keys flowing 189 ms later. One key ran away in setup: its release report was lost, and it repeated until the next key press (see Known risks). **The reworked ACL reader ran on the board (Nov 4):** 593 key reports in about a minute of setup, every notification decoded, and no key ran away (none flagged by the driver, none noticed). But nothing on the pipe needed rescuing either, so where the release was lost is still open. Next: more sessions, a reset from setup, one Windows boot. |
+| Pairing in firmware (optional, off by default) | **Offline only (Nov 15), against an emulated keyboard; not yet on the real keyboard or the board.** A driver built with the `pairing` feature finds a keyboard in pairing mode at boot, shows a passkey, pairs, and hands the bond to the OS. See [Pairing in firmware](#pairing-in-firmware-optional). |
 
 ## Layout
 
@@ -62,7 +63,9 @@ scripts/qemu-driver-test.sh        # driver, offline: self-test typing, no-devic
                                    #   and with the emulated controller and keyboard (rust/bt-emu): a whole session,
                                    #   F2 at boot, an impostor and a keyboard without the key, merged and split USB
                                    #   transfers, a lost key release, bring-up refusals, how a session ends, what
-                                   #   a scan hears
+                                   #   a scan hears; and pairing in firmware: by passkey with Secure Connections
+                                   #   and with legacy pairing, what is refused, a new pairing on request, the
+                                   #   bond handed to the OS
                                    #   (ONLY="1 7" runs some)
 SB=1 TPM=1 scripts/qemu-driver-test.sh  # the same with Secure Boot on (test keys) and a TPM 2.0 (swtpm)
 scripts/tpm-host-test.sh           # the driver's TPM code (seal, unseal, refusals) against swtpm on the host
@@ -75,6 +78,12 @@ scripts/qemu-hw-boot.sh [240]      # REAL CONTROLLER: driver loaded at boot (Dri
                                    #   F2 must be an F-key, not a media key: check the keyboard's Fn lock.
                                    #   FRESH=1: new NV store; WINDOW= LIVE=1: serial console in the terminal instead
 scripts/qemu-hw.sh "<cmd>" ...     # REAL CONTROLLER: any shell commands
+BT_KB_FEATURES=pairing scripts/build-rust.sh   # a driver that pairs in firmware (insecure-legacy-pairing: with LE
+                                   #   legacy pairing too); BT_KB_HANDOFF_KEY or private/handoff.pub: the key its
+                                   #   bond is handed to the OS under
+scripts/bond-handoff.py keygen|open|import ...  # the OS side of that: make the key, open the hand-off, give the bond
+                                   #   to BlueZ (scripts/systemd/bt-kb-handoff.service does it at boot); selftest
+sudo scripts/board-install.sh --pair   # REAL BOARD: ask the installed driver for a new pairing at the next boot
 sudo scripts/board-install.sh      # REAL BOARD: driver + firmware image + bond to \EFI\btkb\, Driver#### entry; signs the
                                    #   driver with sbctl's db key, or DB_KEY/DB_CERT (a file or pkcs11: URI); with Secure
                                    #   Boot on, refuses what doesn't verify (--dry-run shows the steps, --remove undoes it)
@@ -156,6 +165,7 @@ out of git:
   - **What it plays:** the MT7922's USB function (descriptors, MediaTek's vendor channel, the HCI pipes), an HCI controller with one LE link, and a keyboard on it with the real keyboard's GATT layout (handles, report IDs, 21 HID characteristics, as traced on Nov 1).
   - **How the keyboard behaves:** as the real one was seen to. It advertises when a key is pressed (directed at its bonded host first, then undirected with the HID service, as in the Nov 1 scan), encrypts only with the bond it holds, sends key reports only on an encrypted link, asks for connection parameters 5 s in, and disconnects when idle. Its pairing button (`pairing-mode` in a script) makes it discoverable, with its name in the scan response.
   - **Scripts:** each test gives it a script of what the user does and what to expect (`type …`, `wait encrypted`, `expect smp-from-host = 0`; `rust/bt-emu/src/script.rs`), including what a real keyboard never does: key reports on an unencrypted link, pairing packets, a key the keyboard doesn't have, reports merged or split across USB transfers.
+  - **Pairing:** the keyboard's side of it, LE legacy pairing and LE Secure Connections, written from the specification and checked against its sample data. The script's `read-passkey` reads the passkey off the PC's screen (QEMU's serial log) and types it, as a person would; `set impostor 1` is a device that pairs without knowing it (legacy pairing only).
   - **Limits:** it sits at the HCI, above the link layer, so nothing is encrypted and no radio is involved. Its own answers are held to the Bluetooth and USB specifications and to the traces, not to the real chip's firmware.
   - **The ACL pipe is lossless here:** QEMU drops the answer to a read it has already cancelled, and the driver's 1 ms reads are cancelled about 100 times a second. The emulator notices (the cancel arrives for a read it has answered) and sends the data again; `set lose-on-cancel 1` in a script loses it instead, as a real controller passed through to QEMU does.
 - **Self-test keys:** `bt-kb-dxe.selftest` may contain `{f2}`, `{esc}`, `{enter}`, `{tab}`, `{bs}`, arrows (`{up}` …) and `{wait:MS}`.
@@ -403,6 +413,41 @@ out of git:
     independent implementations (Python's hmac and hashlib,
     `tpm2_policypcr`).
 
+### Pairing in firmware (optional)
+
+By default the driver never pairs: the bond comes from the OS (`export-bond.sh`), and the build pins it. A driver built with the `pairing` feature can make the bond itself, so that a keyboard can be paired with no OS involved, and no OS ever has to pair. **This has run offline only, against the emulated keyboard (`rust/bt-emu`); nothing of it has been tried on the real keyboard, the real controller or the board.**
+
+```sh
+sudo install -d -m 700 /etc/bt-kb
+sudo python3 -I scripts/bond-handoff.py keygen /etc/bt-kb/handoff.key > private/handoff.pub   # once: the hand-off key
+BT_KB_FEATURES=pairing scripts/build-rust.sh    # or insecure-legacy-pairing (see below)
+sudo scripts/board-install.sh                   # no bond in qemu/keys/: none is installed
+# scripts/systemd/bt-kb-handoff.service: gives the bond to BlueZ at every boot
+sudo scripts/board-install.sh --pair            # later: a new pairing at the next boot
+```
+
+- **When it is offered:** at a boot without any bond, and at the boot after `--pair` (a marker file, `bt-kb-dxe.pair`, which the driver deletes). With a bond in place and no marker, nothing is offered and no pairing packet passes.
+- **What you see:** the boot stops before the boot loader, and the firmware's screen asks for a keyboard in pairing mode. When one is found, it shows six digits to type on that keyboard, then Enter. The keyboard works from then on. With no keyboard in pairing mode, the boot goes on after 30 s (a key on another keyboard skips the wait).
+- **What the driver insists on:**
+  - Passkey entry: the PC can only show a passkey, so the device has to take it as input. A pairing without a passkey (Just Works) is refused when its result comes.
+  - A 128-bit key, a bond with a key for later connections, and the address the device was found under (keyboards with private addresses aren't supported).
+  - The controller's own word that this very link was encrypted with the pairing's key (stage 1's rule, extended): until the pairing is accepted, the link gives no keystrokes.
+  - A new passkey for every try, and three tries per boot. The passkey is on the screen only, not in the log.
+  - Random numbers of its own (CPU, TPM, firmware) mixed into the host stack's seed, which otherwise comes from the controller alone.
+- **LE Secure Connections only, unless you opt out.** With LE legacy pairing the passkey proves nothing to the PC: a device that takes part in the pairing can work it out from the PC's own messages and pair without ever seeing the screen (the tests do it: offline case 22). `insecure-legacy-pairing` allows it all the same, because many keyboards, the one this project is for among them, can't do Secure Connections. With that build, **anyone in radio range can pair a device and type while pairing is offered**: at every boot of a PC that has no keyboard paired, and at the boot after `--pair`. Pair where nobody else's devices are near, and don't leave such a PC unpaired.
+
+What changes against the stages above:
+
+| Goal | With a bond paired in firmware |
+| --- | --- |
+| 1. Root can't make the firmware trust another keyboard | The bond isn't pinned by the signed driver. It is trusted because only pre-boot code can write its variable (`BtKbPaired`, boot-services only): that rests on Secure Boot and on the firmware's flash being write-protected. Root can ask for a pairing; someone then has to be at the screen (Secure Connections) or in radio range (legacy). |
+| 2. No plaintext key at rest outside the root file system | The bond is a plaintext copy in the firmware's NVRAM, like stage 3's. |
+| 3. Sealed to the TPM | Not yet: the driver can't seal. With a seal that allows no copy (`fallback=no`), pairing in firmware is off, and a bond paired before is deleted. |
+| 4. Nothing from before encryption is a keystroke | As before; and nothing from before the pairing is accepted. |
+| 5. In radio range without the key: no keystrokes | As before once paired. While pairing is offered: see above. |
+
+**The hand-off to the OS.** The keyboard holds one key per host, and firmware and OS are the same host: the OS has to use the firmware's bond. The driver is built with a public key (pinned like the firmware image, so whoever can write the ESP can't redirect it) and publishes the bond encrypted to it at every boot, in the volatile variable `BtKbHandOff`: an ephemeral P-256 key, HKDF-SHA256, the record XOR a key stream, HMAC-SHA256 (`rust/uefi-bt/src/handoff.rs`). Everyone can read the variable; only the private key in `/etc/bt-kb/handoff.key` opens it. `scripts/bond-handoff.py import` writes the key into BlueZ's store before `bluetoothd` starts, if it isn't there already, and keeps a copy of the file it changes. Not tried against a running BlueZ yet; Windows gets nothing yet.
+
 ### Residual risks
 
 - **A keystroke in firmware no longer proves physical presence.** Anyone
@@ -448,6 +493,17 @@ out of git:
   could change what gets built (the trusted bond digests, say) before you
   sign it with an off-machine key. Signing protects only what you meant to
   sign if the build itself can be trusted.
+
+- **Pairing in firmware, if you build it in** (see above): a bond made in
+  firmware isn't pinned by the signed driver, sits unsealed in NVRAM, and
+  with `insecure-legacy-pairing` anyone in radio range can pair while
+  pairing is offered. The private half of the hand-off key
+  (`/etc/bt-kb/handoff.key`) opens every hand-off: it is as secret as the
+  bond itself, and belongs on an encrypted root file system.
+- **The controller is trusted.** At the HCI an old packet looks like a new
+  one; what tells them apart is the link layer's packet counter and
+  integrity check, inside the controller. A controller, or a USB path to
+  it, that replays or invents packets types what it likes.
 
 ## License
 
